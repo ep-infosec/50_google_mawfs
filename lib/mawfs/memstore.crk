@@ -1,0 +1,183 @@
+# Copyright 2016 Google Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+## A NodeStore implemented in memory.  This is mainly useful for testing.
+
+import crack.cont.array Array;
+import crack.cont.hashmap HashMap;
+import crack.enc.base64 altEncode;
+import crack.hash.sha256 SHA256;
+import crack.io StringWriter;
+import crack.lang Exception;
+import crack.logger debug;
+import crack.protobuf readMessageFromString, Message, ProtoWriter;
+import mawfs.blockstore Change, ChangeEntry, Chunk, ChunkSet, Commit,
+    JournalIter, Node, NodeStore, RemoteReader, Session;
+
+@import crack.ann impl;
+
+## A NodeStore implemented entirely in memory.
+class MemNodeStore @impl NodeStore {
+    HashMap[String, String] __objs = {};
+    HashMap[String, Array[String]] __journal = {};
+    HashMap[String, String] __branches = {};
+    String __root;
+    HashMap[String, Session] __sessions = {};
+
+    Chunk __toChunk(Message message) {
+        # Construct a digest from the object contents.
+        StringWriter temp = {};
+        ProtoWriter pw = {temp};
+        message.serialize(pw);
+        hasher := SHA256();
+        serialized := temp.string();
+        hasher.update(serialized);
+        return Chunk(serialized, hasher.digest());
+    }
+
+    String __store(Message message) {
+        chunk := __toChunk(message);
+        __objs[chunk.digest] = chunk.contents;
+        return chunk.digest;
+    }
+
+    void setRemoteReader(RemoteReader remoteReader) {
+        throw Exception('Not implemented.');
+    }
+
+    String storeNode(Node node) {
+        return __store(node);
+    }
+
+    String makeDigest(Node node) {
+        chunk := __toChunk(node);
+        return chunk.digest;
+    }
+
+    @final bool __load(String digest, Message msg) {
+        serialized := __objs.get(digest);
+        if (serialized is null)
+            return false;
+        readMessageFromString(msg, serialized);
+        return true;
+    }
+
+    Node getNode(String digest) {
+        Node node = {};
+        return __load(digest, node) ? node : null;
+    }
+
+    NodeAndStatus getNodeAndStatus(String digest) {
+        NodeAndStatus node = {};
+        return __load(digest, node) ? node : null;
+    }
+
+    String storeCommit(Commit commit) {
+        return __store(commit);
+    }
+
+    Commit getCommit(String digest) {
+        Commit commit = {};
+        return __load(digest, commit) ? commit : null;
+    }
+
+    CommitAndStatus getCommitAndStatus(String digest) {
+        CommitAndStatus commit = {};
+        return __load(digest, commit) ? commit : null;
+    }
+
+    void setHead(String branch, String head) {
+        __branches[branch] = head;
+    }
+
+    String getHead(String branch) {
+        return __branches.get(branch);
+    }
+
+    bool deleteHead(String branch) {
+        if (__branches.hasKey(branch)) {
+            __branches.delete(branch);
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    @static String __digest(String data) {
+        SHA256 hasher = {};
+        hasher.update(data);
+        return hasher.digest();
+    }
+
+    class __JIter @impl JournalIter {
+        Array[String].ArrayIter __iter;
+
+        oper init(Array[String].ArrayIter iter) : __iter = iter {}
+
+        ChangeEntry elem() {
+            if (!__iter)
+                return null;
+
+            Change change = {};
+            readMessageFromString(change, __iter.elem());
+            return ChangeEntry(__digest(__iter.elem()), change);
+        }
+
+        void next() { if (iter) __iter.next() }
+        bool isTrue() { return __iter }
+    }
+
+    JournalIter makeJournalIter(String branch) {
+        arr := __journal.get(branch);
+        return __JIter(arr ? arr.iter() : null);
+    }
+
+    uint getJournalSize(String branch) {
+        journal := __journal.get(branch);
+        if (!journal)
+            return 0;
+        uint total;
+        for (elem :in journal)
+            total += elem.size;
+        return total;
+    }
+
+    String writeToJournal(String branch, Change change) {
+        arr := __journal.get(branch);
+        if (!arr)
+            __journal[branch] = arr = Array[String]();
+        data := change.toString();
+        arr.append(data);
+        return __digest(data);
+    }
+
+    void deleteJournal(String digest) {
+        if (__journal.hasKey(digest))
+            __journal.delete(digest);
+    }
+
+    void invalidateSession(String branch) {
+        if (ses := __sessions.get(branch))
+            ses.reset();
+    }
+
+    Session getSession(String branch) {
+        ses := __sessions.get(branch);
+        if (!ses)
+            __sessions[branch] = ses = Session();
+        return ses;
+    }
+
+    ChunkSet getTraversed() { return null }
+}

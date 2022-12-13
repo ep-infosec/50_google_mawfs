@@ -1,0 +1,488 @@
+# Copyright 2016 Google Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+## FUSE interface.
+
+import mawfs.blockstore Commit, Node, NodeStore, MODE_DIR;
+import crack.cont.hashmap HashMap;
+import crack.enc.base64 altDecode, altEncode;
+import crack.ext._fuse fuse_main = main, get_context, DoubleTimeSpec,
+    FuseConnInfo, FuseOperations, FuseFileInfo;
+import crack.fs makePath, Path;
+import crack.io SeekableReader, SeekableWriter, SEEK_SET;
+import crack.lang Buffer, Exception, SystemError, WriteBuffer;
+import crack.logger debug, error, info, warn;
+import crack.runtime free, memcpy, Stat, TimeVal, EACCES, EEXIST, EINVAL,
+    ENOENT, ENOTDIR, O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_WRONLY, S_IFDIR,
+    S_IFREG;
+import crack.strutil split, StringArray;
+import crack.threads Mutex, MutexLock;
+import mawfs.path MAWFSPath;
+import mawfs.cache CachedNode, NodeContext, Tree;
+
+import .inst FileInfo, InstanceState, UserModule;
+
+@import crack.ann interface;
+
+const int ENOSYS = 38, ENOTEMPTY = 39, EISDIR = 21;
+
+## A filesystem context.  This is created when we come into a fuse entrypoint
+## and must be destroyed when the operation is complete.
+class Context {
+    InstanceState __fs;
+    MutexLock __lock;
+
+    oper init(InstanceState fs) :
+        __fs = fs,
+        __lock = __fs.lock() {
+    }
+
+    @static Context get() {
+        fs := InstanceState.unsafeCast(get_context().private_data);
+        context := Context(fs);
+        return context;
+    }
+
+    ## Get the path object for the fully qualified 'path', return null if
+    ## there is none.
+    Path getPath(byteptr path) {
+        pathStr := String(path);
+
+        # Special case the root directory.
+        if (pathStr == '/')
+            return __fs.getRoot();
+
+        # Look up the Path object, return null if we get to a non-directory.
+        components := split(pathStr, b'/');
+        Path cur = __fs.getRoot();
+        for (int i = 1; i < components.count(); ++i) {
+            if (cur && cur.isDir())
+                cur = cur[components[i]];
+            else
+                return null;
+        }
+
+        return cur;
+    }
+
+    FileInfo makeFileInfo(Path path, SeekableReader reader,
+                          SeekableWriter writer
+                          ) {
+        return __fs.makeFileInfo(MAWFSPath.cast(path, null), reader, writer);
+    }
+
+    FileInfo getFileInfo(uint64 fh) {
+        return __fs.getFileInfo(fh);
+    }
+
+    void deleteFileInfo(uint64 fh) {
+        __fs.deleteFileInfo(fh);
+    }
+
+    void commit() {
+        __fs.commit();
+    }
+}
+
+voidptr _init(FuseConnInfo connInfo) {
+    fs := InstanceState.unsafeCast(get_context().private_data);
+    lock := fs.lock();
+    fs.start();
+    return fs;
+}
+
+int _getattr(byteptr path, Stat stbuf)
+{
+    info `in getattr($path, $stbuf)`;
+    try {
+        ctx := Context.get();
+        p := ctx.getPath(path);
+        if (p && p.exists()) {
+            stat := p.getStat();
+            stbuf.st_mode = stat.st_mode;
+            stbuf.st_nlink = stat.st_nlink;
+            stbuf.st_uid = stat.st_uid;
+            stbuf.st_gid = stat.st_gid;
+            stbuf.st_size = p.getSize();
+            stbuf.st_mtime = p.getModTime();
+            return 0;
+        } else {
+            return -ENOENT;
+        }
+    } catch (Exception ex) {
+        error `getattr: $ex`;
+        return -EINVAL;
+    }
+}
+
+int _readdir(byteptr path, voidptr buf,
+             function[int, voidptr, byteptr, Stat, uint64] filler,
+             uint64 offset,
+             FuseFileInfo fi
+             ) {
+    info `in readdir($path, buf, filler, $offset, $fi)`;
+    try {
+        ctx := Context.get();
+        if (p := ctx.getPath(path)) {
+            filler(buf, ".".buffer, null, 0);
+            filler(buf, "..".buffer, null, 0);
+
+            # Fill in all of the child entries.
+            for (item :in p.children())
+                filler(buf, item.getName().buffer, item.getStat(), 0);
+
+            return 0;
+        } else {
+            return -ENOENT;
+        }
+    } catch (Exception ex) {
+        error `readdir: $ex`;
+        return -EINVAL;
+    }
+}
+
+int _open(byteptr path, FuseFileInfo fi) {
+    info `in open($path, $fi) (flags = $(fi.flags))`;
+    try {
+        ctx := Context.get();
+        p := ctx.getPath(path);
+        if (p && !p.isDir()) {
+            SeekableReader reader;
+            SeekableWriter writer;
+            flags := fi.flags & 3;
+            if (flags == O_RDONLY || flags == O_RDWR) {
+                reader = p.reader();
+            }
+
+            if (fi.flags & O_APPEND && p.exists()) {
+                writer = p.appender();
+            } else if (flags == O_WRONLY || flags == O_RDWR) {
+                writer = p.writer();
+            }
+
+            fi.fh = ctx.makeFileInfo(p, reader, writer).fh;
+            return 0;
+        } else {
+            return -ENOENT;
+        }
+    } catch (Exception ex) {
+        error `open: $ex`;
+        return -EINVAL;
+    }
+}
+
+int _read(byteptr path, byteptr buf, uintz size, uint64 offset,
+          FuseFileInfo fi
+          ) {
+    info `in read($path, buf, $size, $offset, $fi)`;
+    try {
+        ctx := Context.get();
+        info := ctx.getFileInfo(fi.fh);
+        if (!((info ? info.reader : null) is null)) {
+            WriteBuffer temp = {buf, 0, size};
+            info.reader.seek(int64(offset), SEEK_SET);
+            return info.reader.read(temp);
+        } else {
+            return -EINVAL;
+        }
+    } catch (Exception ex) {
+        error `read: $ex`;
+        return -EINVAL;
+    }
+}
+
+int _write(byteptr path, byteptr buf, uintz size, uint64 offset,
+           FuseFileInfo fi
+           ) {
+    info `in write($path, buf, $size, $offset, $fi)`;
+    try {
+        ctx := Context.get();
+        info := ctx.getFileInfo(fi.fh);
+        if (info && info.writer) {
+            info.writer.seek(int64(offset), SEEK_SET);
+            info.writer.write(Buffer(buf, size));
+            return size;
+        } else {
+            return -EINVAL;
+        }
+    } catch (Exception ex) {
+        error `write: $ex`;
+        return -EINVAL;
+    }
+}
+
+int _flush(byteptr path, FuseFileInfo fi) {
+    info `in flush($path, $fi)`;
+    try {
+        ctx := Context.get();
+        info := ctx.getFileInfo(fi.fh);
+        if (info) {
+            if (info.writer)
+                info.writer.flush();
+            return 0;
+        } else {
+            return -ENOENT;
+        }
+    } catch (Exception ex) {
+        error `flush: $ex`;
+        return -EINVAL;
+    }
+}
+
+int _readlink(byteptr path, byteptr buffer, intz size) {
+    info `readlink not implemented\n`;
+    return -ENOSYS;
+}
+
+int _truncateCommon(byteptr path, uintz size) {
+    try {
+        ctx := Context.get();
+        p := ctx.getPath(path);
+        if (p && p.exists()) {
+            p.truncate(size);
+            return 0;
+        } else {
+            return -ENOENT;
+        }
+    } catch (Exception ex) {
+        error `truncate: $ex`;
+        return -EINVAL;
+    }
+}
+
+int _truncate(byteptr path, uint64 size) {
+    info `in truncate($path, $size)`;
+    return _truncateCommon(path, size);
+}
+
+int _ftruncate(byteptr path, uint64 size, FuseFileInfo fi) {
+    info `in ftruncate($path, $size)`;
+    return _truncateCommon(path, size);
+}
+
+int _mknod(byteptr path, int major, int minor) {
+    info `mknod not implemented`;
+    return -ENOSYS;
+}
+
+int _create(byteptr path, int mode, FuseFileInfo fi) {
+    info `in create($path, mode, $fi)`;
+    try {
+        ctx := Context.get();
+        p := ctx.getPath(path);
+        if (p) {
+            fi.fh = ctx.makeFileInfo(p, null, p.writer()).fh;
+            return 0;
+        } else {
+            return -ENOENT;
+        }
+    } catch (Exception ex) {
+        error `create: $ex`;
+        return -EINVAL;
+    }
+}
+
+int _mkdir(byteptr path, int mode) {
+    info `in mkdir($path, $mode)`;
+    try {
+        ctx := Context.get();
+        p := ctx.getPath(path);
+        if (p) {
+            try {
+                p.makeDir();
+                return 0;
+            } catch (SystemError ex) {
+                # TODO: return error code from ex.
+                info `exception in mkdir: $ex`;
+                return -EINVAL;
+            }
+        } else {
+            return -ENOENT;
+        }
+    } catch (Exception ex) {
+        error `mkdir: $ex`;
+        return -EINVAL;
+    }
+}
+
+int _chmod(byteptr path, int mode) {
+    info `in chmod($path, $mode)`;
+    # Succceed and do nothing.
+    return 0;
+}
+
+int _access(byteptr path, int uid) {
+    info `in access($path, $uid)`;
+    return 0;
+}
+
+int _rename(byteptr path, byteptr newPath) {
+    info `in rename($path, $newPath)`;
+    try {
+        ctx := Context.get();
+        p0 := ctx.getPath(path);
+        p1 := ctx.getPath(newPath);
+        if (!p0 || !p0.exists() || !p1 || !p1.parent().exists())
+            return -ENOENT;
+        p0.moveTo(p1);
+        return 0;
+    } catch (Exception ex) {
+        error `rename: $ex`;
+        return -EINVAL;
+    }
+}
+
+int _chown(byteptr path, int uid, int gid) {
+    info `in chown($path, $uid, $gid)\n `;
+    # Succceed and do nothing.
+    return 0;
+}
+
+int _utimens(byteptr path, DoubleTimeSpec times) {
+    info `in utimens($path, $times)`;
+    try {
+        ctx := Context.get();
+        p := ctx.getPath(path);
+        if (!p || !p.exists())
+            return -ENOENT;
+        secs := times.getMTimeSecs();
+        if (secs == p.getModTime())
+            return 0;
+        if (mp := MAWFSPath.cast(p, null)) {
+            mp.setModTime(int32(secs));
+        } else {
+            warn `$path is not a MAWFSPath`;
+        }
+    } catch (Exception ex) {
+        error `utimens: $ex`;
+        return -EINVAL;
+    }
+    return 0;
+}
+
+int _release(byteptr path, FuseFileInfo fi) {
+    info `in release($path, $fi)`;
+    try {
+        ctx := Context.get();
+        if (ctx.getFileInfo(fi.fh)) {
+            ctx.deleteFileInfo(fi.fh);
+            return 0;
+        } else {
+            return -EINVAL;
+        }
+    } catch (Exception ex) {
+        error `release: $ex`;
+        return -EINVAL;
+    }
+}
+
+int _fsyncdir(byteptr path, int datasync, FuseFileInfo fi) {
+    info `in fsyncdir($path, $datasync, $fi)`;
+    try {
+        ctx := Context.get();
+        ctx.commit();
+        return 0;
+    } catch (Exception ex) {
+        error `fsyncdir: $ex`;
+        return -EINVAL;
+    }
+}
+
+int _rmdir(byteptr path) {
+    info `in rmdir($path)`;
+    try {
+        ctx := Context.get();
+        p := ctx.getPath(path);
+        if (p && p.exists()) {
+            if (!p.isDir())
+                return -ENOTDIR;
+            try {
+                p.delete();
+            } catch (SystemError ex) {
+                return -ENOTEMPTY;
+            }
+        } else {
+            return -ENOENT;
+        }
+        return 0;
+    } catch (Exception ex) {
+        error `rmdir: $ex`;
+        return -EINVAL;
+    }
+}
+
+int _unlink(byteptr path) {
+    info `in unlink($path)`;
+    try {
+        ctx := Context.get();
+        p := ctx.getPath(path);
+        if (p && p.exists()) {
+            if (p.isDir())
+                return -EISDIR;
+            p.delete();
+        } else {
+            return -ENOENT;
+        }
+        return 0;
+    } catch (Exception ex) {
+        error `unlink: $ex`;
+        return -EINVAL;
+    }
+}
+
+## Does fuse_main().  Do this if you're implementing a simple
+## filesystem-per-process.
+int main(StringArray argv, InstanceState fs) {
+    ops := FuseOperations();
+    ops.init = _init;
+    ops.getattr = _getattr;
+    ops.readdir = _readdir;
+    ops.open = _open;
+    ops.read = _read;
+    ops.write = _write;
+    ops.flush = _flush;
+    ops.truncate = _truncate;
+    ops.ftruncate = _ftruncate;
+    ops.readlink = _readlink;
+    ops.mknod = _mknod;
+    ops.create = _create;
+    ops.mkdir = _mkdir;
+    ops.chmod = _chmod;
+    ops.rename = _rename;
+    ops.chown = _chown;
+    ops.utimens = _utimens;
+    ops.release = _release;
+    ops.fsyncdir = _fsyncdir;
+    ops.rmdir = _rmdir;
+    ops.unlink = _unlink;
+
+    # Lock the instance.
+    # "if" is just sorcery for the lack of "with"
+    if (lock := fs.lock()) {
+
+        # Create another link to the root object so we can safely exit.
+        fs.getRoot().oper bind();
+
+        # This is incorrect, but it mostly works.  Assume argv[1] is the mount
+        # point.
+        if (argv.count() > 0)
+            fs.setMountpoint(makePath(argv[1]));
+    }
+    return fuse_main(argv.count(), argv.makePrimArray(), ops, fs);
+}
+
+## mutex: the mutex that locks the entire filesystem
+void runFuse(InstanceState instState, StringArray argv) {
+    main(argv, instState);
+}

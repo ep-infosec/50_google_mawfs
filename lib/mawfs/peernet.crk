@@ -1,0 +1,485 @@
+## The peer network code.
+
+import crack.ascii toLower;
+import crack.cont.array Array;
+import crack.fs Path;
+import crack.io cerr, Formatter, FStr, StandardFormatter, StringFormatter,
+    StringReader, Writer;
+import crack.lang Buffer, Exception;
+import crack.logger cerrLogger, DEBUG, ERROR, INFO, FATAL, WARN;
+import crack.logger.ctx Log;
+import crack.net Address, InetAddress;
+import crack.net.comm2 Comm, ConnectionFactory;
+import crack.net.ssl SSLContext;
+import mawfs.blockstore RemoteReader;
+import mawfs.configstore ConfigStore;
+import mawfs.rawchunk RawChunkReader;
+import mawfs.rpc parseAddr, Context, ExtendedAddress, InstIFace,
+    PeerDisconnectedError, PeerProxy, PeerServiceConnectionFactory, METHODS;
+
+import .ciphers Cipher;
+import .inst InstanceState;
+import .params ParamInfo;
+
+@import crack.ann cvars, define, impl, interface, struct;
+
+## Thrown by pullParams() in the case of an invalid password.
+class InvalidPasswordError : Exception {
+    oper init(String message) : Exception(message) {}
+}
+
+@abstract class Peer {
+    @abstract PeerProxy getProxy();
+    @abstract String getName();
+    @abstract String getDisplayName();
+    @abstract void shutdown();
+    @abstract bool reusable();
+}
+
+class PeerNetwork;
+
+@abstract class PeerNetInstIFace @impl InstIFace {
+    @abstract void setPeerNetwork(PeerNetwork net);
+}
+
+## A peer for connecting to a server.
+class ServerPeer : Peer {
+    Address addr;
+    String __name;
+    Comm __comm;
+    Log __log;
+    PeerProxy __proxy;
+    Cipher __cipher;
+    SSLContext __sslCtx;
+    RawChunkReader __chunkReader;
+    String __myName;
+
+    ## sslCtx: nullable. if present, use ssl.
+    oper init(Comm comm, Log log, Address addr, String name, Cipher cipher,
+              SSLContext sslCtx,
+              RawChunkReader chunkReader,
+              String myName
+              ) :
+        addr = addr,
+        __name = name,
+        __comm = comm,
+        __log = log,
+        __cipher = cipher,
+        __sslCtx = sslCtx,
+        __chunkReader = chunkReader,
+        __myName = myName {
+    }
+
+    ## Returns the peer proxy, creating it if necessary.
+    PeerProxy getProxy() {
+        if (!__proxy) {
+            __proxy = PeerProxy.make(__comm, __log, addr, __sslCtx, METHODS,
+                                     __chunkReader);
+            if (__proxy) {
+                __proxy.login(__cipher);
+                __proxy.peerConnected(__myName);
+            }
+        }
+        return __proxy;
+    }
+
+    void formatTo(Formatter out) {
+        out `server-$addr`;
+    }
+
+    String getName() {
+        return __name;
+    }
+
+    String getDisplayName() {
+        return FStr() `$addr`;
+    }
+
+    ## Shutdown the proxy, if active.
+    void shutdown() {
+        if (__proxy)
+            __proxy.shutdown();
+    }
+
+    bool reusable() { return true }
+}
+
+## A peer for connecting to a client.
+class ClientPeer : Peer {
+    @cvars{
+        String name;
+        PeerProxy __proxy;
+    }
+
+    PeerProxy getProxy() { return __proxy }
+    String getName() { return name }
+    String getDisplayName() { return name }
+    void shutdown() { if (__proxy) __proxy.shutdown() }
+    bool reusable() { return false }
+    void formatTo(Formatter out) { out `client-$name` }
+}
+
+## Encapsulates the entire peer subsystem.  Starts a server and manages
+## connections to all peers.
+class PeerNetwork {
+    Comm __comm;
+    Log __log;
+    RawChunkReader __chunkReader;
+    Array[Peer] __peers = {};
+    Array[String] __serverAddrs = {};
+    Cipher __cipher;
+    String __name;
+    SSLContext __sslCtx;
+    PeerNetInstIFace __inst;
+
+    oper init(RawChunkReader chunkReader, Cipher cipher,
+              String name,
+              PeerNetInstIFace inst
+              ) :
+        __chunkReader = chunkReader,
+        __cipher = cipher,
+        __name = name,
+        __inst = inst {
+
+        # The instance should not normally be null, but it can be in tests.
+        if (__inst)
+            __inst.setPeerNetwork(this);
+
+        __log = Log(cerrLogger, 'peernet');
+        __comm = Comm(__log);
+        __comm.start();
+    }
+
+    oper del() {
+        if (__inst)
+            __inst.setPeerNetwork(null);
+    }
+
+    void setSSLContext(SSLContext sslCtx) {
+        __sslCtx = sslCtx;
+    }
+
+    Comm getComm() { return __comm }
+
+    void addServer(ExtendedAddress addr) {
+        ConnectionFactory factory =
+            PeerServiceConnectionFactory(__chunkReader, __inst);
+        __log.info `starting server on $addr:$(addr.ssl ? 'ssl' : 'tcp')`;
+        try {
+            useSSL := __sslCtx && addr.ssl;
+            if (useSSL)
+                factory = __sslCtx.makeConnectionFactory(factory);
+            __comm.startServer(addr, factory, true);
+            __serverAddrs.append(
+                FStr() `$addr:$(useSSL ? 'ssl' : 'tcp')`
+            );
+        } catch (Exception ex) {
+            __log.error `Error starting server: $ex\n`;
+        }
+    }
+
+    void addPeer(String name, ExtendedAddress addr) {
+        __peers.append(ServerPeer(__comm, Log(__log, FStr() `peer-$addr`),
+                                  addr,
+                                  name,
+                                  __cipher,
+                                  addr.ssl ? __sslCtx : null,
+                                  __chunkReader,
+                                  __name
+                                  )
+                       );
+    }
+
+    ## Add a client-side named peer.  This will pre-empt any peer of the same
+    ## name.
+    void addPeer(String name, PeerProxy proxy) {
+        peer := ClientPeer(name, proxy);
+        for (iter :on __peers) {
+            if (iter.elem().getName() == name) {
+                __peers[iter.index] = peer;
+                return;
+            }
+        }
+        __peers.append(peer);
+    }
+
+    ## A a new peer object constructed by the user (intended for testing).
+    void addPeer(Peer peer) {
+        __peers.append(peer);
+    }
+
+    void shutdown() {
+        for (peer :in __peers)
+            peer.shutdown();
+        __peers.clear();
+        # Used to be in oper del()
+        __comm.stop();
+    }
+
+    void __deletePeers(Array[uint] indexes) {
+        // Delete in reverse order to preserve indexes.
+        for (int i = indexes.count() - 1; i > -1; --i)
+            __peers.delete(indexes[i]);
+    }
+
+    @define iterPeers(code) {
+
+        const MOVE_TO_BACK := 0x80000000;
+
+        # Adding an index with the high bit set causes the index to be moved
+        # to the end of the array, without the high bit it is deleted.
+        class Organizer : Array[uint] {
+            @cvars { Array[Peer] peers; }
+            oper del() {
+                // Delete in reverse order to preserve indexes.
+                for (int i = count() - 1; i > -1; --i) {
+                    if (this[i] & MOVE_TO_BACK) {
+                        idx := this[i] & 0x7fffffff;
+                        temp := peers[idx];
+                        peers.delete(idx);
+                        peers.append(temp);
+                    } else {
+                        peers.delete(this[i]);
+                    }
+                }
+            }
+
+            void addPeer(Array[Peer].ArrayIter iter) {
+                append(iter.index | (iter.elem().reusable() ? 0x80000000 : 0));
+            }
+        }
+        organizer := Organizer(__peers);
+        for (peerIter :on __peers) {
+            peer := peerIter.elem();
+            proxy := peer.getProxy();
+            if (proxy) {
+                try
+                    code
+                catch (PeerDisconnectedError ex) {
+                    __log.debug `Peer $(peer.getDisplayName()) disconnected.`;
+                    organizer.addPeer(peerIter);
+                }
+            } else {
+                __log.debug `unable to get proxy for $(peer.getDisplayName())`;
+                __log.info I`$(peer.reusable() ? 'reordering' : 'deleting') \
+                             closed client peer \
+                             $(peer.getDisplayName())`;
+                organizer.addPeer(peerIter);
+            }
+        }
+    }
+
+    @struct HeadAndPeer {
+        ## Head commit digest.
+        String head;
+
+        ## Peer name.
+        String peer;
+    }
+    HeadAndPeer getHead(String branch) {
+        @iterPeers({
+            __log.debug `got peer proxy for $(peer.getDisplayName())`;
+            head := proxy.getHead(branch);
+            if (head)
+                return HeadAndPeer(head, peer.getName());
+        });
+
+        return null;
+    }
+
+    String getObject(String digest) {
+        @iterPeers({
+            contents := proxy.getObject(digest);
+            if (contents)
+                return contents;
+        });
+
+        return null;
+    }
+
+    ## Pull the entire journal from a peer.
+    ##
+    ## Returns null if no peer was able to supply the branch.
+    ##
+    ## TODO: we really need to get the journal and head from the same peer at
+    ## the same time.  If the remote peer commits while we're pulling, the
+    ## journal will change out from under us.
+    ##
+    ## root: Root of the backing directory to replicate into.
+    ## branch: branch of the journal.
+    ## peer: proxy of the desired peer
+    ## qualified: If true, store as a local tracking branch.
+    String __pullJournal(Path root, String branch, Peer peer,
+                         PeerProxy proxy,
+                         bool qualified
+                         ) {
+        Writer dst;
+        uint pos;
+        __log.info `Pulling journal from $peer`;
+
+        # Get the first block.
+        jb := proxy.getJournalBlock(null, branch, 0);
+
+        localName :=
+            qualified ? peer.getName() + ':' + branch : branch;
+        branchPath := root/'journals'/localName;
+        if (jb.contents) {
+            branchPath.parent().makeDirs();
+            dst = branchPath.writer();
+            dst.write(jb.contents);
+            pos = jb.contents.size;
+        } else if (branchPath.exists()) {
+            # No journal.  Remove any existing journal file of the same
+            # name.
+            branchPath.delete();
+        }
+
+        while (!jb.done) {
+            jb := proxy.getJournalBlock(jb.firstBlockDigest, branch,
+                                        pos
+                                        );
+            if (jb.contents) {
+                pos += jb.contents.size;
+                dst.write(jb.contents);
+            } else if (!jb.firstBlockDigest && !jb.done) {
+                # The journal has changed.
+                # TODO: This is where we really need to get the new
+                # head and start over again.
+                __log.info `Remote journal has changed.`;
+                branchPath.delete();
+                break;
+            }
+
+            if (jb.done)
+                break;
+        }
+
+        __log.info `Journal of size $pos retrieved.`;
+        return localName;
+    }
+
+    ## Pull the journal from the specified peer.
+    String pullJournal(Path root, String branch, Peer peer, bool qualified) {
+        proxy := peer.getProxy();
+        if (!proxy)
+            throw Exception(
+                FStr() `Unable to connect to peer $(peer.getName())`
+            );
+        return __pullJournal(root, branch, peer, proxy, qualified);
+    }
+
+    ## Pull the entire journal file from any peer that has it.  Returns null
+    ## if no peer was able to supply the branch.
+    String pullJournal(Path root, String branch, bool qualified) {
+        @iterPeers({
+            return __pullJournal(root, branch, peer, proxy, qualified);
+        });
+        return null;
+    }
+
+    ## Pull the params file from a peer.  Returns null if no peer could be
+    ## found.
+    ## Throws InvalidPasswordError on an invalid password, RemoteError if the peer
+    ## doesn't have a params file (or runs into problems reading it) and any
+    ## of the exceptions raised by ParamInfo.read() if the file is corrupt,
+    ParamInfo pullParams(Path root, String password) {
+        @iterPeers({
+            __log.info `Pulling params from $peer`;
+            contents := proxy.getFile('params');
+            pi := ParamInfo.read(StringReader(contents), password);
+            if (!pi)
+                throw Exception('Invalid password');
+            root.makeDirs();
+            (root/'params').writeAll(contents);
+            return pi;
+        });
+        return null;
+    }
+
+    ## Convfigure the peer network from the config store.
+    void configure(ConfigStore config) {
+
+        ifaceStr := config.get('server', 'iface', '');
+        portStr := config.get('server', 'port', '');
+        enabled := config.get('server', 'enabled', '');
+        ssl := config.get('server', 'ssl', '');
+
+        # If "enabled" is not explicitly defined, infer whether to run a
+        # server based on whether "port" or "iface" is defined.
+        if (!enabled && (ifaceStr || portStr) || toLower(enabled) == 'true') {
+            addr := ifaceStr ? ifaceStr : '0.0.0.0';
+            if (portStr)
+                addr = FStr() `$addr:$portStr:$(ssl == 'true' ? 'ssl' : 'tcp')`;
+            inetAddr := parseAddr(addr);
+            if (!inetAddr)
+                __log.error `Unable to start server on address $addr\n`;
+            else
+                addServer(inetAddr);
+        }
+
+        ## Initialize peers.
+        for (section :in config) {
+            if (section.key.startsWith('peer-')) {
+                peerName := section.key.substr(5);
+                peerInfo := section.val;
+                addrStr := peerInfo.get('host');
+                if (!addrStr) {
+                    __log.error `No "host" parameter for peer $peerName.`;
+                    continue;
+                }
+
+                portStr := peerInfo.get('port');
+                if (portStr)
+                    addrStr = FStr() `$addrStr:$portStr`;
+
+                ssl := peerInfo.get('ssl') == 'true';
+                if (ssl)
+                    addrStr = FStr() `$addrStr:ssl`;
+
+                inetAddr := parseAddr(addrStr);
+                if (inetAddr) {
+                    __log.info `adding peer $peerName at $inetAddr`;
+                    addPeer(peerName, inetAddr);
+                } else {
+                    __log.error `unable to resolve $addrStr for peer $peerName`;
+                }
+            }
+        }
+    }
+
+    ## Store the list of servers we're exposing in the instance state file.
+    ##
+    ## The caller must hold the lock on 'state'.
+    void storeServersIn(InstanceState state) {
+        StringFormatter tmp = {};
+        for (addr :in __serverAddrs)
+            tmp `$addr\n`;
+        state.setInfoFile('servers', tmp.string());
+    }
+
+
+    ## Return the list of peers.
+    Array[Peer] getPeers() {
+        return __peers;
+    }
+
+    ## Returns the peer, null if it doesn't exist.
+    Peer getPeer(String name) {
+        for (peer :in __peers) {
+            if (peer.getName() == name)
+                return peer;
+        }
+        return null;
+    }
+}
+
+## Adapter between a PeerNetwork and a RemoteReader.
+class RemoteReaderImpl @impl RemoteReader {
+    PeerNetwork __net;
+
+    oper init(PeerNetwork net) : __net = net {}
+
+    String getContents(String digest) {
+        return __net.getObject(digest);
+    }
+}

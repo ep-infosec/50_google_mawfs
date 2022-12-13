@@ -1,0 +1,1031 @@
+# Copyright 2016 Google Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import crack.ascii rstrip;
+import crack.cmdline CmdOptions, Option, CMD_STR;
+import crack.cont.hashmap HashMap;
+import crack.fs cwd, makePath, Path;
+import crack.hash.sha256 SHA256;
+import crack.io cerr, FStr, SEEK_SET;
+import crack.lang AppendBuffer, AssertionError, Buffer, Exception,
+    ManagedBuffer;
+import crack.process Process, ProcessHandler, ProcessHandlerImpl,
+    CRK_PROC_EXITED, CRK_PIPE_STDIN, CRK_PIPE_STDOUT;
+import crack.strutil StringArray;
+import crack.sys argv, exit;
+import crack.time Time;
+import crack.runtime open, close, random, sleep, srandom, O_RDONLY;
+
+import mawfs.params ParamInfo;
+import test.unittest register, runAllTests, Test, TestFailure;
+
+import 'libc.so.6' fsync, chown;
+int fsync(int fd);
+int chown(byteptr path, int user, int group);
+
+@import crack.ann assert, impl;
+
+# Change directory to the parent of this file.
+cwd.set(makePath(argv[0]).parent().parent());
+
+# Parse command line options.
+opts := CmdOptions![
+    Option('crack-path', 'c', 'path to the crack binary', 'crack', CMD_STR)
+];
+otherArgs := opts.parse().subarray(1);
+crackPath := opts.getString('crack-path');
+
+const TEST_PASSWORD := 'TestPasswordDudeBestAsstwordFood';
+String _expandPw(String pw) {
+    hasher := SHA256();
+    hasher.update(TEST_PASSWORD);
+    return hasher.digest();
+}
+const EXPANDED_TEST_PASSWORD := _expandPw(TEST_PASSWORD);
+
+bool gotFailures;
+
+@abstract class TestCase : Test {
+
+    ## Deletes the backing directory and returns it.
+    Path deleteBacking() {
+        backing := makePath('backing');
+        if (backing.exists())
+            backing.deleteTree();
+        return backing;
+    }
+
+    ## Run the MAWFS command with 'args' and return the exit code.
+    int runMawfsWithStdinRC(StringArray args, AppendBuffer stdout,
+                            String stdin
+                            ) {
+        cmd := StringArray![crackPath, './mawfs'];
+        cmd.extend(args);
+        pipeStdout := (stdout is null) ? 0 : CRK_PIPE_STDOUT;
+        proc := Process(cmd, CRK_PIPE_STDIN | pipeStdout);
+        proc.putStdIn(stdin);
+        proc.closeStdIn();
+
+        ProcessHandler handler;
+        if (pipeStdout) {
+            class MyProcessHandler : ProcessHandlerImpl {
+                oper init(AppendBuffer stdout) {
+                    outBuf = stdout;
+                }
+
+                void onOutData(Buffer buf) {
+                    outBuf.extend(buf)
+                }
+            }
+            handler = MyProcessHandler(stdout);
+        }
+
+        return proc.run(handler) & 0xff;
+    }
+
+    int runMawfsRC(StringArray args, AppendBuffer stdout) {
+        return runMawfsWithStdinRC(args, stdout,
+                                   'TestPasswordDudeBestAsstwordFood'
+                                   );
+    }
+
+    int runMawfsRC(StringArray args) { return runMawfsRC(args, null) }
+
+    ## Run the mawfs command, throw an exception if there was an error.
+    void runMawfs(StringArray args, AppendBuffer stdout) {
+        if (runMawfsRC(args, stdout))
+            throw Exception('Failed in startup');
+    }
+
+    void runMawfs(StringArray args) { runMawfs(args, null) }
+
+    void startFS(String branch, String backing, String dir) {
+        runMawfs(StringArray!['run', '-b', branch, '--no-server',
+                              '-l','mawfs_' + dir + '.log', '-n', dir,
+                              backing, '-v', 'debug', dir]);
+    }
+
+    void startFS(String branch) {
+        startFS(branch, 'backing', 'fs');
+    }
+
+    void stopFS(String dir) {
+        if (!(makePath(dir)/'.mawfs').exists())
+            return;
+
+        rc := Process(StringArray!['fusermount', '-uz', dir]).run();
+        if (rc != CRK_PROC_EXITED) {
+            # There seems to be a timing issue here. This doesn't always
+            # succeed on the first try.  So if the unmount fails, sleep and
+            # try again one more time.
+            sleep(1);
+            cerr `trying unmount again\n`;
+            rc = Process(StringArray!['fusermount', '-uz', 'fs']).run();
+        }
+
+        if (rc != CRK_PROC_EXITED || failed)
+            cerr `fusermount failed\n`;
+    }
+
+    void restartFS(String branch) {
+        stopFS('fs');
+        startFS(branch);
+    }
+
+    void restartSlaveFS(String branch) {
+        stopFS('fs2');
+        makePath('mawfs_fs2.log').moveTo(makePath('mawfs_fs2.old.log'));
+        startFS(branch, 'backing2', 'fs2');
+    }
+
+    void setUp() {
+        deleteBacking().makeDir();
+        fsDir := makePath('fs');
+        if (!fsDir.exists())
+            fsDir.makeDir();
+        startFS('master');
+    }
+
+    void tearDown() {
+        stopFS('fs');
+        if (failed)
+            cerr `$(makePath('mawfs_fs.log').readAll())\n`;
+        deleteBacking();
+    }
+
+    ## Get the names of all files in 'dir', if 'dir' is null, get all files
+    ## in the root of fs.
+    StringArray getAllFiles(Path dir) {
+        d := dir ? dir : makePath('fs');
+
+        StringArray result = {};
+        for (file :in d.children())
+            result.append(file.getName());
+
+        return result;
+    }
+}
+
+class EmptyDirTest : TestCase {
+    void run() {
+        if (files := getAllFiles(null))
+            throw TestFailure(FStr() `got files in empty dir: $files`);
+    }
+}
+register(EmptyDirTest());
+
+class FileTest : TestCase {
+
+    void run() {
+        foo := makePath('fs')/'foo';
+        foo.writer().write('this is some data');
+        if ((files := getAllFiles(null)) != StringArray!['foo'])
+
+        assertEqual(foo.readAll(), 'this is some data');
+
+        reader := foo.reader();
+        reader.seek(4, SEEK_SET);
+        ManagedBuffer buf = {4};
+        reader.read(buf);
+        assertEqual(String(buf, true), ' is ');
+    }
+}
+register(FileTest());
+
+class MkDirTest : TestCase {
+    void run() {
+        dir := makePath('fs')/'dir';
+        dir.makeDir();
+
+        if (!dir.isDir())
+            throw TestFailure(FStr() `did not create a directory`);
+    }
+}
+register(MkDirTest());
+
+class MoveTest : TestCase {
+    void run() {
+        a := makePath('fs')/'a';
+        a.writeAll('this is data');
+
+        b := makePath('fs')/'b';
+        a.moveTo(b);
+        if (a.exists())
+            throw TestFailure(FStr() `moved file still exists`);
+
+        if (!b.exists())
+            throw TestFailure(FStr() I`moved file doesn't exist in new \
+                                       location`
+                              );
+        assertEqual(b.readAll(), 'this is data');
+    }
+}
+register(MoveTest());
+
+class SubDirFileTest : TestCase {
+    void run() {
+        dir := makePath('fs')/'dir';
+        dir.makeDir();
+        foo := dir/'foo';
+        foo.writeAll('test data');
+
+        fd := open(makePath('fs').getFullName().buffer, O_RDONLY, 0);
+        fsync(fd);
+        close(fd);
+
+        # Restart to verify that everything got committed properly.
+        stopFS('fs');
+        startFS('master');
+
+        assertEqual(foo.readAll(), 'test data');
+    }
+}
+register(SubDirFileTest());
+
+class TruncateTest : TestCase {
+    void run() {
+        a := makePath('fs')/'a';
+        a.writeAll('some data');
+        a.truncate(0);
+        assertEqual(a.readAll(), '');
+
+        b := makePath('fs')/'b';
+        b.writeAll('more data');
+        b.truncate(10);
+        assertEqual(b.readAll(), 'more data\0');
+    }
+}
+register(TruncateTest());
+
+## Tests the "no-op" functions (chmod and chown).
+class NopTest : TestCase {
+    void run() {
+        a := makePath('fs')/'a';
+        a.writeAll('funky file');
+        a.setMode(0777);
+        chown(a.getFullName().buffer, 1234, 1234);
+
+        # The change is a no-op, so we can't really verify anything.  Just
+        # make sure the file is still as we expect it.
+        @assert(a.readAll() == 'funky file');
+    }
+}
+register(NopTest());
+
+class UnlinkTest : TestCase {
+    void run() {
+        a := makePath('fs')/'a';
+        a.writeAll('some data');
+        a.delete();
+
+        @assert(!a.exists());
+
+        dir := makePath('fs')/'dir';
+        dir.makeDir();
+        b := dir/'b';
+        b.writeAll('more data');
+        b.delete();
+        @assert(!b.exists());
+    }
+}
+register(UnlinkTest());
+
+class RmDirTest : TestCase {
+    void run() {
+        dir := makePath('fs')/'dir';
+        dir.makeDir();
+        dir.delete();
+        @assert(!dir.exists());
+    }
+}
+register(RmDirTest());
+
+class AppendTest : TestCase {
+    void run() {
+        file := makePath('fs/test.txt');
+        file.writeAll('this is contents');
+        file.appender().write('; more contents!');
+        assertEqual(file.readAll(), 'this is contents; more contents!');
+    }
+}
+register(AppendTest());
+
+class AdminFSTest : TestCase {
+    void run() {
+        admin := makePath('fs')/'.mawfs';
+        assertEqual((admin/'branch').readAll(), 'master');
+        @assert((admin/'README').readAll().lfind('Copyright') >= 0);
+        @assert((admin/'inst/servers').readAll() == '');
+    }
+}
+register(AdminFSTest());
+
+class BranchTest : TestCase {
+    void run() {
+        admin := makePath('fs')/'.mawfs';
+        testFile := makePath('fs')/'test.file';
+        testFile.writeAll('file data');
+        restartFS('other');
+        @assert(!testFile.exists());
+        otherFile := makePath('fs')/'other.file';
+        otherFile.writeAll('another file');
+        branchDir := admin/'alt'/'master';
+        branchDir.makeDir();
+        assertEqual((branchDir/'test.file').readAll(), 'file data');
+    }
+}
+register(BranchTest());
+
+## Verify that a params file exists and is readable.
+class ParamsTest : TestCase {
+    void run() {
+        params := makePath('backing/params');
+        @assert(params.exists());
+        @assert(ParamInfo.read(params, EXPANDED_TEST_PASSWORD));
+     }
+ }
+register(ParamsTest());
+
+@abstract class DoubleInstanceTest : TestCase {
+    Path backing2, fs2;
+
+    ## Clone and start the slave.
+    void initSlave() {
+        runMawfs(StringArray!['clone', 'localhost:12543', 'backing2']);
+        startFS('master', 'backing2', 'fs2');
+    }
+
+    void setUp() {
+        backing2 = makePath('backing2');
+        fs2 = makePath('fs2');
+        if (backing2.exists())
+            backing2.deleteTree();
+        if (fs2.exists())
+            fs2.deleteTree();
+        fs2.makeDir();
+        TestCase.setUp();
+    }
+
+    void tearDown() {
+        stopFS('fs2');
+        if (backing2.exists())
+            backing2.deleteTree();
+        if (fs2.exists())
+            fs2.deleteTree();
+        TestCase.tearDown();
+    }
+}
+
+class CloneTest : DoubleInstanceTest {
+    void run() {
+        # Start up a server on port 12543
+        (makePath('backing')/'config/peers').writeAll('[server]\nport = 12543\n');
+        (makePath('fs')/'foo').writeAll('test file contents');
+        restartFS('master');
+        runMawfs(StringArray!['clone', '-n', 'theclone', '-r', 'org',
+                              'localhost:12543',
+                              'backing2']);
+        @assert((backing2/'params').exists());
+        startFS('master', 'backing2', 'fs2');
+        @assert((fs2/'foo').readAll() == 'test file contents');
+
+        # Verify that we've got the correct name.
+        stdout := AppendBuffer(256);
+        runMawfs(StringArray!['info', '-i', 'fs2'], stdout);
+        mount := (cwd/'fs2').getFullName();
+        assertEqual(stdout, FStr() `Name: theclone\nMountpoint: $mount\n`);
+
+        # Verify that the origin name was set up correctly.
+        @assert((backing2/'config/peers').readAll().lfind('[peer-org]') !=
+                -1);
+
+        # Now try doing a "pull" and verify that we see the update in the
+        # new filesystem.
+        (makePath('fs')/'bar').writeAll('more file contents');
+        runMawfs(StringArray!['pull', '-i', 'localhost:9119', 'master']);
+        @assert((fs2/'bar').readAll() == 'more file contents');
+    }
+}
+register(CloneTest());
+
+@abstract class MergeTest : DoubleInstanceTest {
+    void setUp() {
+        DoubleInstanceTest.setUp();
+        (makePath('backing')/'config/peers').writeAll('[server]\nport = 12543\n');
+        (makePath('fs')/'first').writeAll('test file contents');
+        restartFS('master');
+        runMawfs(StringArray!['clone', 'localhost:12543', 'backing2']);
+
+        # Start the new instance
+        startFS('master', 'backing2', 'fs2');
+
+        # Create files on each branch.
+        (makePath('fs')/'on_master').writeAll('on master contents');
+        (makePath('fs2')/'on_slave').writeAll('on slave contents');
+    }
+
+    void pullAndMerge() {
+        runMawfs(StringArray!['pull', '-i', 'localhost:9119', 'master']);
+        runMawfs(StringArray!['merge', '-i', 'localhost:9119',
+                              'origin:master'
+                              ]
+                 );
+    }
+
+    ## Add the slave as a peer and pull "master" back to the master.
+    void pullBack() {
+        runMawfs(StringArray!['addPeer', '-i', 'fs', 'clone',
+                              'localhost:9119'
+                              ]
+                 );
+        runMawfs(StringArray!['pull', '-i', 'fs', 'master']);
+    }
+
+    void verifyJournalWorks() {
+        # Now verify that modifications still work.
+        (makePath('fs2')/'on_master').appender().write(' - yo!');
+        (makePath('fs2')/'on_slave').writeAll('new slave contents');
+        (makePath('fs2')/'alpha').makeDir();
+        (makePath('fs2')/'zulu').makeDir();
+        (makePath('fs2')/'zulu/test').writeAll('zulu test');
+        restartSlaveFS('master');
+        assertEqual((makePath('fs2')/'on_master').readAll(),
+                    'on master contents - yo!'
+                    );
+        assertEqual((makePath('fs2')/'on_slave').readAll(),
+                    'new slave contents'
+                    );
+        @assert((makePath('fs2')/'alpha').exists());
+        @assert((makePath('fs2')/'zulu').exists());
+        assertEqual((makePath('fs2')/'zulu/test').readAll(),
+                    'zulu test'
+                    );
+    }
+}
+
+class MergeWithConflictsTest : MergeTest {
+    void run() {
+        # Mutate some files, create a conflict.
+        (makePath('fs')/'foo').writeAll('new contents');
+        (makePath('fs2')/'foo').writeAll('alt contents');
+
+        pullAndMerge();
+
+        # Verify that the meta-data looks as we expect.
+        curBranch := (makePath('fs2')/'.mawfs'/'branch').readAll();
+        @assert(curBranch.startsWith('merge:'));
+        StringArray branches = {};
+        for (child :in (makePath('fs2')/'.mawfs'/'alt').children())
+            branches.append(child.getName());
+        branches.sort();
+        assertEqual(branches,
+                    StringArray!['merge:org', 'origin:master']
+                    );
+
+        # Verify that file contents are as we expect.
+        fs2 := makePath('fs2');
+        assertEqual((fs2/'on_master').readAll(),
+                    'on master contents'
+                    );
+        assertEqual((fs2/'on_slave').readAll(),
+                    'on slave contents'
+                    );
+        assertEqual((fs2/'foo').readAll(),
+                    'alt contents'
+                    );
+
+        masterFS := fs2/'.mawfs'/'alt'/'origin:master';
+        assertEqual(
+            (masterFS/'on_master').readAll(),
+            'on master contents'
+        );
+        @assert(!(masterFS/'on_slave').exists());
+        assertEqual((masterFS/'foo').readAll(), 'new contents');
+
+        orgFS := fs2/'.mawfs'/'alt'/'merge:org';
+        assertEqual((orgFS/'first').readAll(), 'test file contents');
+        @assert(!(orgFS/'foo').exists());
+        @assert(!(orgFS/'on_master').exists());
+        @assert(!(orgFS/'on_slave').exists());
+
+        # now try doing the merge.
+        (fs2/'foo').writeAll('resolved');
+        runMawfs(StringArray!['resolve', '-i', 'fs2']);
+
+        assertEqual((fs2/'foo').readAll(), 'resolved');
+        assertEqual((fs2/'on_master').readAll(), 'on master contents');
+        assertEqual((fs2/'on_slave').readAll(), 'on slave contents');
+
+        @assert(!masterFS.exists());
+        @assert(!orgFS.exists());
+
+        # Try pulling back to the master and verify that the new commit gets
+        # accepted.
+        pullBack();
+        assertEqual((makePath('fs')/'foo').readAll(), 'resolved');
+
+        verifyJournalWorks();
+    }
+}
+register(MergeWithConflictsTest());
+
+class MergeNoConflictTest : MergeTest {
+    void run() {
+        pullAndMerge();
+
+        # Verify that we ended up in a clean state.
+        masterFS := makePath('fs2')/'.mawfs'/'alt'/'origin:master';
+        @assert(!masterFS.exists());
+        orgFS := makePath('fs2')/'.mawfs'/'alt'/'merge:org';
+        @assert(!orgFS.exists());
+
+        # Shouldn't have a merge branch in the refs.
+        branches := StringArray();
+        for (child :in (makePath('backing2')/'refs').children()) {
+            branches.append(child.getName());
+        }
+        branches.sort();
+        assertEqual(branches, StringArray!['master', 'origin:master']);
+
+        assertEqual((makePath('fs2')/'.mawfs'/'branch').readAll(),
+                    'master'
+                    );
+        assertEqual((makePath('fs2')/'on_master').readAll(),
+                    'on master contents'
+                    );
+        assertEqual((makePath('fs2')/'on_slave').readAll(),
+                    'on slave contents'
+                    );
+
+        # Verify that we can pull into the main branch in the original
+        # instance.
+        pullBack();
+        assertEqual((makePath('fs2')/'.mawfs'/'branch').readAll(),
+                    'master'
+                    );
+        assertEqual((makePath('fs2')/'on_master').readAll(),
+                    'on master contents'
+                    );
+        assertEqual((makePath('fs2')/'on_slave').readAll(),
+                    'on slave contents'
+                    );
+
+        verifyJournalWorks();
+    }
+}
+register(MergeNoConflictTest());
+
+class CancelMergeTest : MergeTest {
+    void run() {
+        # Create a conflict.
+        (makePath('fs')/'foo').writeAll('new contents');
+        (makePath('fs2')/'foo').writeAll('alt contents');
+
+        pullAndMerge();
+
+        # Verify that we're in "outstanding merge" state.
+        mawfsDir := makePath('fs2')/'.mawfs';
+        masterFS := mawfsDir/'alt'/'origin:master';
+        @assert(masterFS.exists());
+        @assert((mawfsDir/'branch').readAll().startsWith('merge:'));
+
+        # Write a local change.
+        (makePath('fs2')/'local_change').writeAll('contents');
+        @assert((makePath('fs2')/'local_change').exists());
+
+        # Verify that we've cleaned up the merge.
+        runMawfs(StringArray!['cancelMerge', '-i', 'localhost:9119']);
+        @assert(!(mawfsDir/'alt').children());
+        assertEqual((mawfsDir/'branch').readAll(), 'master');
+        @assert(!(makePath('fs2')/'local_change').exists());
+
+        (makePath('fs2')/'on_master').writeAll('on master contents');
+        verifyJournalWorks();
+    }
+}
+register(CancelMergeTest());
+
+## Verify that we can restore existing merge states.
+class RestoreStateTest : MergeTest {
+    void run() {
+        # Mutate some files, create a conflict.
+        (makePath('fs')/'foo').writeAll('new contents');
+        (makePath('fs2')/'foo').writeAll('alt contents');
+
+        pullAndMerge();
+        orgDir := makePath('fs2')/'.mawfs'/'alt'/'merge:org';
+        @assert(!(orgDir/'foo').exists());
+        restartSlaveFS('master');
+
+        # Verify that the meta-data looks as we expect after a restart.
+        curBranch := (makePath('fs2')/'.mawfs'/'branch').readAll();
+        @assert(curBranch.startsWith('merge:'));
+        StringArray branches = {};
+        for (child :in (makePath('fs2')/'.mawfs'/'alt').children())
+            branches.append(child.getName());
+        branches.sort();
+        assertEqual(branches,
+                    StringArray!['merge:org', 'origin:master']
+                    );
+
+        # Verify that the origin looks like we expect it to.
+        path := orgDir/'first';
+        assertEqual(path.readAll(), 'test file contents');
+        @assert(!(orgDir/'foo').exists());
+    }
+}
+register(RestoreStateTest());
+
+## Verify we pull a commit with an empty journal correctly.
+class PullEmptyJournalTest : MergeTest {
+    void run() {
+        (makePath('fs')/'foo').writeAll('initial contents');
+        (makePath('fs2')/'bar').writeAll('other contents');
+
+        # pull.
+        runMawfs(StringArray!['pull', '-i', 'localhost:9119', 'master']);
+
+        # verify that we have a journal.
+        @assert(makePath('backing2/journals/origin:master').exists());
+
+        # Commit the master, verify that its journal is gone and load its ref.
+        runMawfs(StringArray!['commit', 'fs']);
+        @assert(!makePath('backing/journals/master').exists());
+        head := makePath('backing/refs/master').readAll();
+
+        # Make sure we don't currently have the same head as the master.
+        @assert(makePath('backing2/refs/origin:master').readAll() !=
+                head)
+
+        # Pull again.
+        runMawfs(StringArray!['pull', '-i', 'localhost:9119', 'master']);
+
+        # make sure we now have an empty journal and the latest head.
+        @assert(!makePath('backing2/journals/origin:master').exists());
+        @assert(makePath('backing2/refs/origin:master').readAll() ==
+                head)
+    }
+}
+register(PullEmptyJournalTest());
+
+## Verify that we can still run things with a missing peer.
+class MissingPeerTest : DoubleInstanceTest {
+
+    void run() {
+        # Move the master to port 12543, clone it to the slave and start the
+        # slave.
+        (makePath('backing')/'config/peers').writeAll('[server]\nport = 12543\n');
+        restartFS('master');
+        initSlave();
+
+        # Shut down both, verify that we can bring up the slave (the slave has
+        # the master as its peer).
+        stopFS('fs');
+
+        restartSlaveFS('master');
+        rc := runMawfsRC(StringArray!['pull', '-i', 'localhost:9119', 'master']);
+        @assert(rc == 1);
+
+        # restart the master, verify that we can pull.
+        restartFS('master');
+        rc = runMawfsRC(StringArray!['pull', '-i', 'localhost:9119',
+                                     'master'
+                                     ]
+                        );
+        @assert(!rc);
+
+        # Now stop the master again, verify that we still get an error.
+        stopFS('fs');
+        rc = runMawfsRC(StringArray!['pull', '-i', 'localhost:9119',
+                                     'master'
+                                     ]
+                        );
+        @assert(rc == 1);
+    }
+}
+register(MissingPeerTest());
+
+class AdminDirAfterFSyncTest : TestCase {
+    void run() {
+        fd := open(makePath('fs').getFullName().buffer, O_RDONLY, 0);
+        fsync(fd);
+        close(fd);
+
+        @assert(makePath('fs/.mawfs').exists());
+    }
+}
+register(AdminDirAfterFSyncTest());
+
+class InfoTest : TestCase {
+    void run() {
+        (makePath('backing')/'config/peers').writeAll('[server]\nport = 12543\n');
+        restartFS('master');
+
+        rootPath := cwd/'fs';
+        @assert((rootPath/'.mawfs').exists());
+        stdout := AppendBuffer(256);
+        runMawfs(StringArray!['info', '-i', rootPath.getFullName()], stdout);
+        assertEqual(stdout, FStr() `Name: fs\nMountpoint: $rootPath\n`);
+    }
+}
+register(InfoTest());
+
+## Test a clone with an invalid password.
+class AuthFailCloneTest : DoubleInstanceTest {
+    void run() {
+        # Start up a server on port 12543
+        (makePath('backing')/'config/peers').writeAll('[server]\nport = 12543\n');
+        (makePath('fs')/'foo').writeAll('test file contents');
+        restartFS('master');
+        rc := runMawfsWithStdinRC(
+            StringArray!['clone', 'localhost:12543', 'backing2'],
+            null,
+            'BaddPassword'
+        );
+        @assert(rc);
+    }
+}
+register(AuthFailCloneTest());
+
+## Test setting/getting time attributes.
+class TimeTest : TestCase {
+
+    void checkTimes(int32 t) {
+        @assert((cwd/'fs/myfile').getModTime() >= t);
+        @assert((cwd/'fs/mydir').getModTime() >= t);
+        @assert((cwd/'fs/opened').getModTime() >= t);
+    }
+
+    void run() {
+        t := Time.now().secs;
+        (cwd/'fs/myfile').writeAll('here is some data');
+        (cwd/'fs/mydir').makeDir();
+        writer := (cwd/'fs/opened').writer();
+
+        checkTimes(t);
+        restartFS('master');
+        checkTimes(t);
+    }
+}
+register(TimeTest());
+
+class TraversalTest : DoubleInstanceTest {
+    Path fsRoot;
+
+    void setUp() {
+        fsRoot = cwd/'fs';
+        DoubleInstanceTest.setUp();
+    }
+
+    void addBigFile() {
+        filename := FStr() `$(random())`;
+        file := (fsRoot/filename).writer();
+        const BUF_SIZE := 71912;
+        buf := AppendBuffer(BUF_SIZE);
+        for (int i = 0; i < BUF_SIZE; ++i)
+            buf.append(byte(random()));
+    }
+
+    void commit() {
+        runMawfs(StringArray!['commit', fsRoot.getFullName()]);
+    }
+
+    void populate() {
+        srandom(0x58f28595);
+        fsRoot := cwd/'fs';
+        addBigFile();
+        commit();
+        addBigFile();
+        commit();
+        addBigFile();
+        commit();
+    }
+
+    StringArray getFiles(Path dir) {
+        files := StringArray();
+        for (child :in dir.children())
+            files.append(child.getName());
+        files.sort();
+        return files;
+    }
+
+    ## Return the list of file names in the object directory (in lexical sort
+    ## order).
+    StringArray getObjects(Path root) { return getFiles(root/'objects') }
+
+    void run() {
+        (makePath('backing')/'config/peers').writeAll('[server]\nport = 12543\n');
+        restartFS('master');
+        initSlave();
+        clonedNodes := getFiles(backing2/'traversed');
+        populate();
+        runMawfs(StringArray!['pull', '-i', 'localhost:9119', '-t', 'none',
+                              'master'
+                              ]
+                 );
+
+        # Get the objects in the slave backing directory.
+        objects := getObjects(backing2);
+
+        # Restart the slave to clear the memory cache.
+        restartSlaveFS('master');
+
+        # Traverse.
+        runMawfs(StringArray!['-i', 'localhost:9119', 'traverse', 'master']);
+
+        # Verify that we've got all of the objects back and then some.
+        newObjects := getObjects(backing2);
+        @assert(objects.count() < newObjects.count());
+
+        masterObjects := getObjects(cwd/'backing');
+        assertEqual(newObjects, masterObjects);
+
+        # Verify that the "traversed" directory is empty.
+        assertEqual(getFiles(backing2/'traversed'), clonedNodes);
+
+        # Do another traversal, this time create the database of nodes that
+        # have been fully traversed.
+        runMawfs(StringArray!['-i', 'localhost:9119', 'traverse', 'master',
+                              '-t', 'delta']);
+        assertEqual(getFiles(backing2/'traversed'), newObjects);
+
+        # Add some new stuff to master.
+        addBigFile();
+        commit();
+
+        runMawfs(StringArray!['pull', '-i', 'localhost:9119', '-t', 'none',
+                              'master'
+                              ]
+                 );
+        objects = getObjects(backing2);
+        masterObjects = getObjects(cwd/'backing');
+        @assert(objects.count() < masterObjects.count());
+
+        runMawfs(StringArray!['traverse', '-i', 'localhost:9119', '-t',
+                              'delta', 'master'
+                              ]
+                 );
+        objects = getObjects(backing2);
+        assertEqual(objects, masterObjects);
+        assertEqual(getFiles(backing2/'traversed'), objects);
+    }
+}
+register(TraversalTest());
+
+class SSLTest : TestCase {
+    bool useSSL() { return true }
+    void run() {
+        (makePath('backing')/'config/peers').writeAll(
+            '[server]\nport = 12543\nssl = true\n');
+        restartFS('master');
+        # Attempt to connect.
+        runMawfs(StringArray!['-i', 'fs', 'info']);
+
+        # Verify that unauthorized local clients work.
+        runMawfs(StringArray!['-i', 'localhost:12543:ssl', 'info']);
+
+        try {
+            runMawfs(StringArray!['-i', 'localhost:12543:tcp', 'info']);
+            @assert(false &&
+                    'No error doing normal TCP connection to SSL server.');
+        } catch (Exception ex) {
+            if (ex.isa(AssertionError))
+                throw ex;
+        }
+
+        # XXX also need to verify that a server can communicate to its peers.
+    }
+}
+register(SSLTest());
+
+class BidirectionalRPCTest : DoubleInstanceTest {
+    void run() {
+        # Start up the master with a server on 12543.
+        (makePath('backing')/'config/peers').writeAll(
+            '[server]\nport = 12543\nssl = true\n');
+
+        (makePath('fs')/'foo').writeAll('test file contents');
+        restartFS('master');
+        runMawfs(StringArray!['clone', 'localhost:12543:ssl', 'backing2']);
+
+        # Start the second instance.
+        startFS('master', 'backing2', 'fs2');
+
+        # Do a pull from the slave to force a connection to the master.
+        runMawfs(StringArray!['-i', 'localhost:9119:ssl', 'pull', 'master']);
+
+        # Now write to bar and pull back to the master.
+        (makePath('fs2')/'bar').writeAll('another test file');
+        runMawfs(StringArray!['-i', 'fs', 'pull', 'master']);
+
+        assertEqual((makePath('fs')/'bar').readAll(), 'another test file');
+    }
+}
+register(BidirectionalRPCTest());
+
+## Verify that we can get a sane error when keeping a file descriptor alive
+## during a commit.
+class OpenFileDescriptorTest : TestCase {
+    void run() {
+        out := (makePath('fs')/'filename.txt').writer();
+        out.write('first line\n');
+        out.write('second line\n');
+
+        runMawfs(StringArray!['commit', 'fs']);
+
+        out.write('third line\n');  # This should give an error.
+
+        contents := (makePath('fs')/'filename.txt').readAll();
+        assertEqual(contents, 'first line\nsecond line\n');
+
+        restartFS('master');
+        out = null;
+        contents = (makePath('fs')/'filename.txt').readAll();
+        assertEqual(contents, 'first line\nsecond line\n');
+    }
+}
+register(OpenFileDescriptorTest());
+
+class PushTest : DoubleInstanceTest {
+    void run() {
+        # Start up the primary with a server on 12543.
+        (makePath('backing')/'config/peers').writeAll(
+            '[server]\nport = 12543\nssl = true\n');
+
+        (makePath('fs')/'foo').writeAll('foo file contents');
+        restartFS('master');
+        runMawfs(StringArray!['clone', 'localhost:12543:ssl', 'backing2']);
+
+        # Start the second instance.
+        startFS('master', 'backing2', 'fs2');
+
+        # Add two files to the secondary, one commited and one in the journal.
+        makePath('fs2/foo').writer().write('got foo?');
+        runMawfs(StringArray!['commit', 'fs2']);
+        makePath('fs2/journaled').writeAll('should be in journal');
+
+        # Make the secondary push to the primary, capture the branch name.
+        buf := AppendBuffer(256);
+        runMawfs(StringArray!['push', '-i', 'localhost:9119:ssl',
+                              'master', 'origin'],
+                 buf
+                 );
+        assertEqual(buf, 'remote branch: master\n');
+
+        # Take down the secondary so that the primary can't pull chunks on
+        # demand.  This ensures that we've done a traversal on the branch.
+        stopFS('fs2');
+
+        # Verify that the primary has everything.
+        assertEqual(makePath('fs/foo').readAll(), 'got foo?');
+        assertEqual(makePath('fs/journaled').readAll(),
+                    'should be in journal'
+                    );
+    }
+}
+register(PushTest());
+
+class SeekTest : TestCase {
+    void run() {
+
+        const FILE_SIZE := 1000000;
+
+        # Create a temporary buffer full of random data, sanity check
+        # readersEqual.
+        tmp := AppendBuffer(FILE_SIZE);
+        srandom(0x58f28595);
+        for (int i; i < FILE_SIZE; ++i)
+            tmp.append(byte(random()));
+
+        file := makePath('fs/file');
+        file.writeAll(tmp);
+
+        String subbuf(Buffer buf, uintz pos, uintz size) {
+            return String(buf, pos, size);
+        }
+
+        # Use plain @assert's here, otherwise we print these binary strings.
+        src := file.reader();
+        @assert(src.read(4096) == subbuf(tmp, 0, 4096));
+        src.seek(100000, SEEK_SET);
+        @assert(src.read(4096) == subbuf(tmp, 100000, 4096));
+        src.seek(200000, SEEK_SET);
+        @assert(src.read(4096) == subbuf(tmp, 200000, 4096));
+        src.seek(65536, SEEK_SET);
+        @assert(src.read(4096) == subbuf(tmp, 65536, 4096));
+    }
+}
+register(SeekTest());
+
+runAllTests();

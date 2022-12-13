@@ -1,0 +1,938 @@
+# Copyright 2016 Google Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import crack.cmdline CmdOptions, Option, CMD_BOOL;
+# altEncode for debugging hash values.
+import crack.enc.base64 altEncode, altDecode;
+import crack.cont.array Array;
+import crack.hash.sha256 SHA256;
+import crack.io cerr, FStr, StringWriter;
+import crack.protobuf ProtoWriter;
+import crack.cont.hashmap HashMap;
+import crack.lang AppendBuffer, ManagedBuffer;
+import crack.logger debug, setLogLevel, DEBUG;
+import mawfs.blockstore Commit, Entry, Node, NodeStore, MODE_DIR;
+import mawfs.entropy setEntropySource;
+import mawfs.memstore MemNodeStore;
+import mawfs.cache sig, Cache, CachedNode, NodeContext, Tree;
+import mawfs.testutil copy, makeRandomData, PseudoRandomEntropySource;
+import mawfs.memtrace Tracer;
+
+@import crack.ann assert, impl;
+
+opts := CmdOptions![
+    Option('fast', 'f', 'Run only fast tests', 'false', CMD_BOOL)
+];
+opts.parse();
+
+fastTests := opts.getBool('fast');
+
+
+Node makeFileNode(String contents, int32 mode) {
+    node := Node();
+    node.contents = contents;
+    node.size = contents ? node.contents.count() : 0;
+    node.mode = mode;
+
+    return node;
+}
+
+Node makeDirNode() {
+    node := Node();
+    node.mode = MODE_DIR;
+    return node;
+}
+
+
+AppendBuffer readAll(CachedNode cached) {
+    AppendBuffer readData = {4096};
+    ManagedBuffer temp = {256};
+    uint64 pos;
+    while (rc := cached.read(pos, temp)) {
+        pos += rc;
+        readData.extend(temp);
+    }
+    return readData;
+}
+
+setLogLevel(DEBUG);
+setEntropySource(PseudoRandomEntropySource());
+
+node := makeFileNode('contents of foo', 0);
+
+nodeStore := MemNodeStore();
+digest := nodeStore.storeNode(node);
+
+root := Node();
+node.children = Array[Entry]();
+root.mode = MODE_DIR;
+entry := Entry();
+entry.hash = digest;
+entry.name = 'foo';
+entry.size = node.size;
+root.children_append(entry);
+root.size = node.size;
+
+digest = nodeStore.storeNode(root);
+
+# NOTE: We should be passing a commit digest to this, but the root digest
+# (or any other non-empty string) should work just as well for this exercise.
+ctx := NodeContext(nodeStore, 'master', digest);
+cachedRoot := CachedNode(ctx, digest, root.clone());
+cachedNode := cachedRoot.getChild(0);
+@assert(cachedNode.getContents() == 'contents of foo');
+
+# Do it again, make sure this works right if the object is loaded.
+cachedNode = cachedRoot.getChild(0);
+@assert(cachedNode.getContents() == 'contents of foo');
+
+# Add a child.
+node = makeFileNode('contents of bar', 0);
+cachedRoot.addChild('bar', node, 0);
+
+@assert(cachedRoot.getChild(0).getContents() == 'contents of bar');
+@assert(cachedRoot.getChild(1).getContents() == 'contents of foo');
+
+# Verify that the insertion order is correct.
+cachedRoot.addChild('cat', makeFileNode('cat contents', 0), 0);
+cachedRoot.addChild('alpha', makeFileNode('alpha contents', 0), 0);
+cachedRoot.addChild('zeta', makeFileNode('zeta contents', 0), 0);
+
+# Rewrite "foo" to test overwrites.
+cachedRoot.addChild('foo', makeFileNode('foo contents', 0), 0);
+cachedRoot.addChild('zzdir', makeDirNode(), 0);
+zzdir := cachedRoot.getChild(5);
+zzdir.addChild('zzfile', makeFileNode('zzfile contents', 0), 0);
+zzdir.addChild('deleted', makeFileNode('deleted file', 0), 0);
+zzdir.deleteChild('deleted', 0);
+
+# Test a write in a subdirectory (propagation code was broken).
+zzfile := cachedRoot.getChild('zzdir').getChild('zzfile');
+zzfile.write(7, 'moar data', 0);
+
+cachedRoot.addChild('zzzshrunk', makeFileNode('original file', 0), 0);
+cachedRoot.getChild('zzzshrunk').resize(5, 0);
+@assert(cachedRoot.getChild('zzzshrunk').getContents() == 'origi');
+
+cachedRoot.addChild('zzzenlarged', makeFileNode('original file', 0), 0);
+cachedRoot.getChild('zzzenlarged').resize(16, 0);
+@assert(cachedRoot.getChild('zzzenlarged').getContents() ==
+         'original file\0\0\0'
+        );
+
+cachedRoot.addChild('zzztruncated', makeFileNode('original file', 0), 0);
+cachedRoot.getChild('zzztruncated').resize(0, 0);
+@assert(!cachedRoot.getChild('zzztruncated').getContents());
+
+cachedRoot.addChild('zzzwasempty', makeFileNode(null, 0), 0);
+cachedRoot.getChild('zzzwasempty').resize(5, 0);
+@assert(cachedRoot.getChild('zzzwasempty').getContents() == '\0\0\0\0\0');
+
+void verifyContents() {
+    @assert(cachedRoot.getChild(0).getContents() == 'alpha contents');
+    @assert(cachedRoot.getChild(1).getContents() == 'contents of bar');
+    @assert(cachedRoot.getChild(2).getContents() == 'cat contents');
+    @assert(cachedRoot.getChild(3).getContents() == 'foo contents');
+    @assert(cachedRoot.getChild(4).getContents() == 'zeta contents');
+    @assert(cachedRoot.getChild(5).getMode() == MODE_DIR);
+    @assert(cachedRoot.getChild(5).getChild(0).getContents() ==
+            'zzfile moar data');
+    @assert(cachedRoot.getChild(5).getChildCount() == 1);
+    @assert(cachedRoot.getChild('zzzshrunk').getContents() == 'origi');
+    @assert(cachedRoot.getChild('zzzenlarged').getContents() ==
+             'original file\0\0\0'
+            );
+    @assert(!cachedRoot.getChild('zzztruncated').getContents());
+    @assert(cachedRoot.getChild('zzzwasempty').getContents() == '\0\0\0\0\0');
+}
+
+# TODO: test committing changes at this point as well as after replaying them
+# back from the cache.
+
+# Test reconstructing changes from cache.
+cachedRoot = CachedNode(ctx, digest, root.clone());
+cachedRoot.replayJournal();
+verifyContents();
+
+# Test committing changes.
+digest = cachedRoot.commit();
+cachedRoot = CachedNode(ctx, digest, nodeStore.getNode(digest));
+verifyContents();
+
+# Test a write.
+cachedRoot.addChild('written', Node(), 0);
+cached := cachedRoot.getChild('written');
+cached.write(0, 'first data', 0);
+if (true) {
+    buf := ManagedBuffer(1024);
+    cached.read(0, buf);
+    @assert(buf == 'first data');
+}
+@assert(cached.getSize() == 10);
+
+# Test appending children.
+if (true) {
+    cerr `appending master\n`;
+    ctx := NodeContext(nodeStore, 'master', digest);
+    ctx.setMaxChildren(4);
+    CachedNode root = {ctx, digest, Node()};
+
+    AppendBuffer originalData = {4096};
+    for (int i = 0; i < 100; ++i) {
+        line := FStr() `this is $i\n`;
+        root.append(line);
+        originalData.extend(line);
+        size := root.verify();
+    }
+
+    @assert(readAll(root) == originalData);
+}
+
+# Case 1: verify that we can insert objects into an empty node.
+if (true) {
+    cerr `inserting objects into an empty node\n`;
+    ctx := NodeContext(nodeStore, 'master', digest);
+    CachedNode root = {ctx, digest, Node()};
+    randomData := makeRandomData();
+    root.write(0, randomData, 0);
+
+    # Make sure we have a nice tree.
+    root.verify();
+}
+
+# TODO: verify that we can insert at an offset in an empty node and that we
+# get filled in with zeroes.
+
+# Write a large amount of random data into the middle of a node with contents.
+if (true) {
+    cerr `write random data into the middle of a content node.\n`;
+    ctx := NodeContext(nodeStore, 'master', digest);
+    CachedNode root = {ctx, digest, Node()};
+    root.node.contents = 'this is a test';
+
+    randomData := String(makeRandomData(), true);
+    root.write(8, randomData, 0);
+
+    @assert(readAll(root) == 'this is ' + randomData);
+    root.verify();
+}
+
+# Write into the middle of a node with contents.
+if (true) {
+    cerr `write simple data into the middle of a content node.\n`;
+    ctx := NodeContext(nodeStore, 'master', digest);
+    CachedNode root = {ctx, digest, Node()};
+    root.node.contents = 'this is a test';
+
+    root.write(5, 'crzy', 0);
+
+    @assert(readAll(root) == 'this crzy test');
+    root.verify();
+}
+
+# Write data after the end of a node with children.
+if (true) {
+    cerr `write data after the end of a node with children\n`;
+    ctx := NodeContext(nodeStore, 'master', digest);
+    CachedNode root = {ctx, digest, Node()};
+
+    # populate an empty node.
+    data := String(makeRandomData(), true);
+    root.write(0, data, 0);
+
+    # Write beyond the end.
+    root.write(data.size + 1000, data, 0);
+
+    @assert(readAll(root) == data + String(1000, 0) + data);
+}
+
+# Write a large amount of random data into a node with children.
+if (false) {
+    cerr `write random data into a node with children\n`;
+    ctx := NodeContext(nodeStore, 'master', digest);
+    CachedNode root = {ctx, digest, Node()};
+
+    # populate an empty node.
+    data := String(makeRandomData(), true);
+    root.write(0, data, 0);
+
+    # Insert random data somewhere.
+    root.write(25000, data, 0);
+}
+
+CachedNode makeSmallFileTree(NodeContext ctx) {
+    NodeContext c;
+    c = ctx ? ctx : NodeContext(nodeStore, 'master', digest);
+    c.setMaxChildren(3);
+    CachedNode root = {c, digest, Node()};
+    root.append('alpha');
+    root.append('bravo');
+    root.append('charlie');
+    root.append('delta');
+    root.append('echo');
+
+    return root;
+}
+
+CachedNode makeSmallFileTree() { return makeSmallFileTree(null) }
+
+# Unit tests for node merge.
+if (true) {
+    cerr `delete nodes\n`;
+    ctx = NodeContext(nodeStore, 'master', digest);
+    tracer := Tracer();
+    tracer.instrument(ctx.getCache());
+    root := makeSmallFileTree(ctx);
+
+    # The root should have two children, one with three content nodes and one
+    # with two.
+    @assert(root.getChildCount() == 2);
+    root.commit();
+
+    root.deleteNode(10); # Delete "charlie".
+    root.deleteNode(5);  # Delete "bravo".
+
+    # Verify that the nodes have been coalesced.
+    @assert(root.getChildCount() == 3);
+    @assert(root.getContents() == 'alphadeltaecho');
+
+    root.verify();
+
+    ctx = NodeContext(nodeStore, 'master', digest);
+    tracer = Tracer();
+    tracer.instrument(ctx.getCache());
+    root = makeSmallFileTree(ctx);
+
+    root.deleteNode(10); # Delete "charlie".
+    root.deleteNode(10); # Delete "delta".
+    root.verify();
+
+    @assert(root.getChildCount() == 3);
+    @assert(root.getContents() == 'alphabravoecho');
+
+    root.commit();
+    initRSize := root.getRSize();
+    ctx.setGCThreshold(ctx.getGCBottom() + initRSize);
+    root.garbageCollect();
+    root.traverseResident(tracer.makeVisitor());
+    @assert(!tracer.hasLeaks());
+    @assert(root.getRSize() < initRSize);
+}
+
+if (true) {
+    cerr `deleteSpan:\n  partial contents\n`;
+    root := makeSmallFileTree();
+    root.deleteSpan(1, 4, 0);
+    root.verify();
+    @assert(root.getContents() == 'aabravocharliedeltaecho')
+
+    #   Deleting a single child
+    cerr `  delete first child\n`;
+    root = makeSmallFileTree();
+    root.deleteSpan(0, 5, 0);
+    root.verify();
+    @assert(root.getContents() == 'bravocharliedeltaecho');
+
+    cerr `  delete last child\n`;
+    root = makeSmallFileTree();
+    root.deleteSpan(22, 27, 0);
+    root.verify();
+    @assert(root.getContents() == 'alphabravocharliedelta');
+
+    cerr `  delete multiple children\n`;
+    root = makeSmallFileTree();
+    root.deleteSpan(0, 10, 0);
+    root.verify();
+    @assert(root.getContents() == 'charliedeltaecho');
+
+    cerr `  delete span crossing multiple children\n`;
+    root = makeSmallFileTree();
+    root.deleteSpan(1, 9, 0);
+    root.verify();
+    @assert(root.getContents() == 'aocharliedeltaecho');
+
+    cerr `  force merge to previous\n`;
+    root = makeSmallFileTree();
+    root.deleteSpan(10, 24, 0);
+    root.verify();
+    @assert(root.getContents() == 'alphabravoho');
+    # Make sure we collapsed the top tier after merging.
+    @assert(root.getChildCount() == 3);
+}
+
+if (true) {
+    cerr `writes into the middle of a file.\n`;
+
+    # Store an initial commit.  This test does a lot of writes, and the
+    # journal quickly grows to 16M, so commits happen.
+    commit := Commit();
+    commit.root = digest;
+    commitDigest := nodeStore.storeCommit(commit);
+    nodeStore.setHead('master', commitDigest);
+
+    root := CachedNode(ctx, digest, Node());
+    randomData := String(makeRandomData(), true);
+    root.write(0, randomData, 0);
+    root.write(500, randomData, 0);
+    @assert(root.getContents() == randomData.substr(0, 500) + randomData);
+
+    # Test writing to the middle of a chunk.
+    root = CachedNode(ctx, digest, Node());
+    root.write(0, randomData, 0);
+    root.write(10, randomData.substr(0, 20), 0);
+    @assert(root.getContents().substr(0, 30) ==
+             randomData.substr(0, 10) + randomData.substr(0, 20)
+            );
+    @assert(root.getContents() ==
+             randomData.substr(0, 10) + randomData.substr(0, 20) +
+             randomData.substr(30)
+            );
+
+    # Test writing in the fingerprint zone of a chunk.
+    root = CachedNode(ctx, digest, Node());
+    root.write(0, randomData, 0);
+    subseq := randomData.substr(0, root.getChunks()[0].size - 20);
+    root.write(10, subseq, 0);
+    @assert(root.getContents() ==
+             randomData.substr(0, 10) + subseq +
+             randomData.substr(10 + subseq.size)
+            );
+
+    # Test writing into the beginning of the second chunk.
+    root = CachedNode(ctx, digest, Node());
+    root.write(0, randomData, 0);
+    firstChunkSize := root.getChunks()[0].size;
+    root.write(firstChunkSize, 'stuff', 0);
+
+    String snippet(String data) {
+        return data.substr(0, 10).getRepr();
+    }
+    contents := root.getContents();
+    @assert(root.getContents() == randomData.substr(0, firstChunkSize) +
+                                  'stuff' +
+                                  randomData.substr(firstChunkSize + 5)
+            );
+
+    if (true) {
+        # Test modifying the fingerprint at the end of a node boundary.
+        ctx = NodeContext(nodeStore, 'master', digest);
+        ctx.setMaxChildren(3);
+        root = CachedNode(ctx, digest, Node());
+        root.write(0, randomData, 0);
+
+        # We should have two leafs grouped under an intermediate node.
+        chunks := root.getChunks();
+        boundary := chunks[0].size + chunks[1].size;
+        cerr `modifying at the end of a root boundary\n`;
+        root.write(boundary - 32, 'xx', 0);
+
+        contents := root.getContents();
+        root.verify();
+        @assert(root.getContents() == randomData.substr(0, boundary - 32) +
+                                      'xx' +
+                                      randomData.substr(boundary - 30)
+                );
+    }
+
+    if (!fastTests) {
+        cerr `boundary tests\n`;
+        # Test the exciting boundary conditions for all existing chunks.
+        # failed at 2170, 17614, 63393, 66881, 66903
+        uint64 startOff, endOff;
+        root = CachedNode(ctx, digest, Node());
+        root.write(0, randomData, 0);
+        chunks := root.getChunks();
+        const EMPTY := randomData.substr(0, 0);
+        for (int i; i < chunks.count(); ++i) {
+            startChunk := chunks[i];
+            int ixi;
+            for (ix :in Array[int]![startOff, startOff + 1,
+                                    startOff + startChunk.size - 32,
+                                    startOff + startChunk.size - 31
+                                    ]
+                ) {
+
+                cerr `$((i * 4 + ixi) * 100 / (chunks.count() * 4))% `;
+                ixi++;
+                endOff = 0;
+                for (int j; j < chunks.count(); ++j) {
+                    endChunk := chunks[j];
+                    for (jx :in Array[int]![endOff - 31, endOff - 32,
+                                            endOff + endChunk.size - 32,
+                                            endOff + endChunk.size - 31,
+                                            endOff + endChunk.size,
+                                            endOff + endChunk.size + 1
+                                            ]
+                        ) {
+                        if (i + ix <= j + jx) {
+                            root = CachedNode(ctx, digest, Node());
+                            root.write(0, randomData, 0);
+                            start := uint64(ix);
+                            size := uint64(jx - start);
+                            if (size > randomData.size)
+                                size = randomData.size;
+                            slice := randomData.substr(0, size);
+                            root.write(start, slice, 0);
+                            @assert(root.getContents() ==
+                                    randomData.substr(0, start) + slice +
+                                    (start + size < randomData.size ?
+                                        randomData.substr(start + size) :
+                                        EMPTY
+                                    )
+                                    );
+                        }
+                    }
+
+                    endOff += endChunk.size;
+                }
+            }
+
+            startOff += startChunk.size;
+        }
+    }
+
+    if (true) {
+        cerr `resize to larger\n`;
+        root = CachedNode(ctx, digest, Node());
+        root.write(0, randomData, 0);
+        cerr `size is $(randomData.size + 1000)\n`;
+        root.resize(randomData.size + 1000, 0);
+        @assert(root.getContents() == randomData + String(1000, 0));
+    }
+
+    if (true) {
+        cerr `resize to smaller\n`;
+        root.write(0, randomData, 0);
+        root.resize(randomData.size - 1000, 0);
+        @assert(root.getContents() ==
+                 randomData.substr(0, randomData.size - 1000)
+                );
+    }
+}
+
+## Writes 'data' into 'node' one small chunk at a time.
+void writeChunked(CachedNode node, String data, uint64 chunkSize) {
+    uint64 i = 0;
+    while (i < data.size) {
+        size := data.size - i;
+        size = (size > chunkSize) ? chunkSize : size;
+        node.write(i, data.substr(i, size), 0);
+        i += chunkSize;
+    }
+}
+
+cerr `appends merge last chunk\n`;
+if (true) {
+    # Write the entire buffer in one fell swoop.
+    randomData := String(makeRandomData(), true);
+    root := CachedNode(ctx, digest, Node());
+    root.write(0, randomData, 0);
+    chunks := root.getChunks();
+    contents := root.getContents();
+
+    # Now write it one page at a time.
+    root = CachedNode(ctx, digest, Node());
+    writeChunked(root, randomData, 4096);
+
+    # Chunking should be the same.
+    @assert(contents == root.getContents());
+    @assert(chunks == root.getChunks());
+}
+
+import crack.io Formatter;
+void writeChunks(Formatter out, Array[String] chunks) {
+    for (chunk :in chunks)
+        out `$(chunk.size), `;
+    cerr `\n`;
+}
+
+cerr `verify auto-commit\n`;
+if (true) {
+    root := CachedNode(ctx, digest, Node());
+
+    # Store an initial commit.
+    commit := Commit();
+    commit.root = digest;
+    commitDigest := nodeStore.storeCommit(commit);
+    nodeStore.setHead('master', commitDigest);
+
+    ctx.setMaxJournalSize(4096);
+    randomData := String(makeRandomData());
+    writeChunked(root, randomData, 1024);
+    @assert(ctx.getJournalSize('master') < 4096);
+    @assert(root.getContents() == randomData);
+
+    # Verify that we can load it back up.
+    commitDigest = nodeStore.getHead('master');
+    commit = nodeStore.getCommit(commitDigest);
+    ctx.recordCommit(commitDigest);
+    root = CachedNode(ctx, commit.root, nodeStore.getNode(commit.root));
+    root.replayJournal();
+    @assert(root.getContents() == randomData);
+}
+
+cerr `commit of unmaterialized node\n`;
+if (true) {
+    ctx = NodeContext(nodeStore, 'master', digest);
+    root := CachedNode(ctx, digest, Node());
+
+    # Store an initial commit.
+    commit := Commit();
+    commit.root = digest;
+    commitDigest := nodeStore.storeCommit(commit);
+    nodeStore.setHead('master', commitDigest);
+
+    # Add some content.
+    root.addChild('a', makeFileNode('contents of a', 0), 0);
+    root.addChild('b', makeFileNode('contents of b', 0), 0);
+    root.commitTree();
+
+    # reload.
+    commitDigest = nodeStore.getHead('master');
+    commit = nodeStore.getCommit(commitDigest);
+    root = CachedNode(ctx, commit.root, nodeStore.getNode(commit.root));
+
+    root.addChild('c', makeFileNode('contents of c', 0), 0);
+    root.commitTree();
+}
+
+cerr `delete and then modify.\n`;
+if (true) {
+    nodeStore = MemNodeStore();
+    ctx = NodeContext(nodeStore, 'master', null);
+    root := CachedNode(ctx, null, makeDirNode());
+    root.commitTree();
+    baselineCommitDigest := ctx.getBaselineCommit();
+    data := String(makeRandomData());
+    root.addChild('zombie', makeFileNode(data, 0), 0);
+    root.addChild('healthy', makeFileNode('some data', 0), 0);
+    zombie := root.getChild('zombie');
+    zombie.addExtRef();
+    root.deleteChild('zombie', 0);
+    zombie.write(zombie.getSize(), 'foo', 0);
+    zombie.write(zombie.getSize(), 'bar', 0);
+    zombie.write(zombie.getSize(), 'baz', 0);
+    @assert(zombie.getContents() == data + 'foobarbaz');
+    zombie.releaseExtRef();
+
+    @assert(root.getChild('zombie') is null);
+
+    # Do some modifications to healthy after the updates to zombie.
+    healthy := root.getChild('healthy');
+    healthy.write(healthy.getSize(), ', more data', 0);
+
+    # Reload
+    ctx = NodeContext(nodeStore, 'master', baselineCommitDigest);
+    commitDigest := nodeStore.getHead('master');
+    commit := nodeStore.getCommit(commitDigest);
+    root = CachedNode(ctx, commit.root, nodeStore.getNode(commit.root));
+    root.replayJournal();
+
+    @assert(root.getChild('healthy').getContents() == 'some data, more data');
+    @assert(root.getChild('zombie') is null);
+}
+
+cerr `journal session ids.\n`;
+if (true) {
+    # Resset the entropy source so that changes to earlier tests won't affect
+    # this one.
+    setEntropySource(PseudoRandomEntropySource());
+    nodeStore = MemNodeStore();
+    ctx = NodeContext(nodeStore, 'master', null);
+    root := CachedNode(ctx, null, makeDirNode());
+    root.addChild('foo', makeFileNode('some data', 0), 0);
+    root.commitTree();
+
+    # At this point, we should have a head node containing a single session id.
+    commit := ctx.getCommit(ctx.getHead());
+    @assert(commit.journalInfo);
+    info := ctx.getJournalInfo(commit.journalInfo);
+    @assert(info && info.count() == 1);
+    const SESID := 'p1HCYtqKJQE';
+    @assert(sig(info.iter().elem().key) == SESID);
+
+    # Record a journal with multiple sessions.
+    root.addChild('bar', makeFileNode('other data', 0), 0);
+    ctx.setSessionId('should be present');
+    root.addChild('baz', makeFileNode('still more', 0), 0);
+    ctx.setSessionId('should be absent');
+    root.commitTree();
+    commit = ctx.getCommit(ctx.getHead());
+    @assert(commit.journalInfo);
+    info = ctx.getJournalInfo(commit.journalInfo);
+    @assert(info && info.count() == 2);
+    @assert(info.hasKey('should be present'));
+    @assert(info.hasKey(altDecode(SESID)));
+
+    # Verify that only the last session id is preserved after a commit.
+    root.addChild('elmo', makeFileNode('elmo is elmo!', 0), 0);
+    root.commitTree();
+    commit = ctx.getCommit(ctx.getHead());
+    @assert(commit.journalInfo);
+    info = ctx.getJournalInfo(commit.journalInfo);
+    @assert(info && info.count() == 1);
+    @assert(info.hasKey('should be absent'));
+
+    # Verify that a new session id shows up after invalidating it in the
+    # NodeStore.
+    root.addChild('telly', makeFileNode('what will we do!?', 0), 0);
+    nodeStore.invalidateSession('master');
+    root.addChild('grover', makeFileNode('super grover!', 0), 0);
+    root.commitTree();
+    commit = ctx.getCommit(ctx.getHead());
+    info = ctx.getJournalInfo(commit.journalInfo);
+    @assert(info && info.count() == 2);
+    iter := info.iter();
+    @assert(iter.elem().key == 'should be absent');
+    iter.next();
+    @assert(sig(iter.elem().key) == 'JdbclZ.bhxw');
+}
+
+cerr `Node comparison\n`;
+if (true) {
+    nodeStore = MemNodeStore();
+    ctx = NodeContext(nodeStore, 'master', null);
+    a := CachedNode(ctx, null, makeDirNode());
+    b := CachedNode(ctx, null, makeFileNode('some data', 0));
+    @assert(a < b);
+
+    a = CachedNode(ctx, null, makeFileNode('this is foo', 0));
+    b = CachedNode(ctx, null, makeFileNode('this is foo', 0));
+    @assert(a == b);
+
+    b = CachedNode(ctx, null, makeFileNode('this is not foo', 0));
+    @assert(a < b);
+
+    a = CachedNode(ctx, null, makeDirNode());
+    a.addChild('foo', makeFileNode('foo contents', 0), 0);
+    b = CachedNode(ctx, null, makeDirNode());
+    b.addChild('foo', makeFileNode('foo contents', 0), 0);
+    @assert(a == b);
+
+    a.addChild('goo', makeFileNode('goo contents', 0), 0);
+    @assert(a > b);
+
+    b.addChild('goo', makeFileNode('goo contents', 0), 0);
+    @assert(a == b);
+
+    b.addChild('hoo', makeFileNode('hoo contents', 0), 0);
+    @assert(a < b);
+
+    a = CachedNode(ctx, null, makeFileNode('this is foo', 0));
+    a.commitTree();
+    b = CachedNode(ctx, null, makeFileNode('this is foo', 0));
+    b.commitTree();
+    @assert(a == b)
+    @assert(a.digest == b.digest);
+
+    a = CachedNode(ctx, null, makeDirNode());
+    a.addChild('foo', makeFileNode('this is foo', 0), 0);
+    b = CachedNode(ctx, null, makeDirNode());
+    b.addChild('bar', makeFileNode('this is foo', 0), 0);
+    @assert(a > b);
+}
+
+cerr `Deep node copies\n`;
+if (true) {
+    nodeStore = MemNodeStore();
+    ctx = NodeContext(nodeStore, 'master', null);
+    ctx2 := NodeContext(nodeStore, 'slave', null);
+
+    # Make a little tree.
+    src := CachedNode(ctx, null, makeDirNode());
+    subdir := CachedNode(ctx, null, makeDirNode());
+    src.addChild('dir', subdir, 0);
+    unchangedNode := makeFileNode('unchanged after commit', 0);
+    subdir.addChild('unchanged', unchangedNode, 0);
+    fileNode := CachedNode(ctx, null, Node());
+    subdir.addChild('changed', fileNode, 0);
+    fileNode.write(0, makeRandomData(), 0);
+    subdir.addChild('deleted', makeFileNode('deleted', 0), 0);
+
+    # Commit it.
+    src.commitTree();
+
+    # Store the digest of the unchanged node.
+    unchangedDigest := subdir.getChild('unchanged').digest;
+
+    # Change it up.
+    subdir = src.getChild('dir');
+    fileNode = subdir.getChild('changed');
+    fileNode.write(0, 'blah blah blah', 0);
+    changedNodeContents := fileNode.getContents();
+    @assert(changedNodeContents.startsWith('blah blah blah'));
+    added := CachedNode(ctx, null, makeFileNode('added file', 0));
+    subdir.addChild('added', added, 0);
+    subdir.deleteChild('deleted', 0);
+    subdir.addChild('unchangedCopy',
+                    CachedNode(ctx, unchangedDigest, unchangedNode),
+                    0
+                    );
+
+    # Copy into a new tree.
+    dst := CachedNode(ctx2, null, makeDirNode());
+    # Reproducing the functionality of "InstanceState.create()" here, maybe
+    # this belongs in NodeContext or Tree?
+    rootDigest := nodeStore.storeNode(dst.node);
+    commit := Commit();
+    commit.root = rootDigest;
+    ctx2.storeCommit(commit);
+    dst.addChild('dir', src.getChild('dir').copy(ctx2), 0);
+
+    # Verify that we can replay it.
+    newRoot := Tree(nodeStore, 'slave').getRoot();
+    subdir = newRoot.getChild('dir');
+    @assert(subdir.getChild('unchanged').getContents() ==
+             'unchanged after commit'
+            );
+    @assert(subdir.getChild('added').getContents() == 'added file');
+    @assert(subdir.getChild('changed').getContents() == changedNodeContents);
+    @assert(subdir.getChild('deleted') is null);
+    @assert(subdir.getChild('unchangedCopy').getContents() ==
+            'unchanged after commit'
+            );
+}
+
+cerr `Commits during write.\n`;
+if (true) {
+    nodeStore = MemNodeStore();
+    ctx = NodeContext(nodeStore, 'master', null);
+
+    ctx.getCache().maxJournalSize = 100;
+
+    # Write a large file to the source tree.
+    src := CachedNode(ctx, null, makeDirNode());
+    fileNode := CachedNode(ctx, null, Node());
+    src.addChild('file', fileNode, 0);
+    fileData := String(makeRandomData());
+    fileNode.addExtRef();
+    fileNode.write(0, fileData.substr(0, 1024), 0);
+    fileNode.write(1024, fileData.substr(1024, 2048), 0);
+    fileNode.write(2048, fileData.substr(2048), 0);
+    fileNode.releaseExtRef();
+
+    # Verify that it's all still there.
+    root := Tree(nodeStore, 'master').getRoot();
+    @assert(root.getChild('file').getContents() == fileData);
+}
+
+cerr `Commits during a child copy.\n`;
+if (true) {
+    nodeStore = MemNodeStore();
+    ctx = NodeContext(nodeStore, 'master', null);
+    ctx2 := NodeContext(nodeStore, 'slave', null);
+
+    ctx2.getCache().maxJournalSize = 100;
+
+    # Write a large file to the source tree.
+    src := CachedNode(ctx, null, makeDirNode());
+    fileNode := CachedNode(ctx, null, Node());
+    src.addChild('changed', fileNode, 0);
+    fileData := makeRandomData();
+    fileNode.write(0, fileData, 0);
+
+    # Copy to the destination tree.
+    dst := CachedNode(ctx2, null, makeDirNode());
+    dst.addChild('changed', fileNode.copy(ctx2), 0);
+
+    # Verify that we've committed and that there is no journal.
+    newRoot := Tree(nodeStore, 'slave').getRoot();
+    @assert(newRoot.getChild('changed').getContents() == fileData);
+    @assert(!ctx2.makeJournalIter());
+}
+
+cerr `Rewriting an empty file - single chunk.\n`;
+if (true) {
+    nodeStore = MemNodeStore();
+    ctx = NodeContext(nodeStore, 'master', null);
+    root := CachedNode(ctx, null, makeDirNode());
+    root.addChild('foo', Node(), 0);
+    root.getChild('foo').write(0, 'first data', 0);
+    root.getChild('foo').resize(0, 0);
+    root.getChild('foo').write(0, 'second data', 0);
+    @assert(root.getChild('foo').getContents() == 'second data');
+}
+
+cerr `Rewriting an empty file - multi-chunk.\n`;
+if (true) {
+    nodeStore = MemNodeStore();
+    ctx = NodeContext(nodeStore, 'master', null);
+    root := CachedNode(ctx, null, makeDirNode());
+    root.addChild('foo', Node(), 0);
+    root.getChild('foo').write(0, 'first data', 0);
+    root.getChild('foo').resize(0, 0);
+    randomData := makeRandomData();
+    root.getChild('foo').write(0, randomData, 0);
+    @assert(root.getChild('foo').getContents() == randomData);
+}
+
+cerr `set/get time.\n`;
+if (true) {
+    nodeStore = MemNodeStore();
+    ctx = NodeContext(nodeStore, 'master', null);
+    root := CachedNode(ctx, null, makeDirNode());
+    root.commitTree();
+
+    root.setTime(100);
+    @assert(root.getTime() == 100);
+
+    # Verify that we can replay the change.
+    newRoot := Tree(nodeStore, 'master').getRoot();
+    @assert(newRoot.getTime() == 100);
+}
+
+cerr `time changes during mutations\n`;
+if (true) {
+    nodeStore = MemNodeStore();
+    ctx = NodeContext(nodeStore, 'master', null);
+    root := CachedNode(ctx, null, makeDirNode());
+    root.commitTree();
+
+    file := root.addChild('file', Node(), 100);
+    file.write(0, 'some data', 200);
+    @assert(root.getTime() == 100);
+    @assert(root.getChild('file').getTime() == 200);
+    resized1 := root.addChild('resized1', Node(), 101);
+    resized1.write(0, 'data', 201);
+    resized1.resize(2, 301);
+    @assert(resized1.getTime() == 301);
+
+    resized2 := root.addChild('resized2', Node(), 102);
+    resized2.write(0, 'data', 202);
+    resized2.resize(10, 302);
+    @assert(resized2.getTime() == 302);
+
+    resized3 := root.addChild('resized3', Node(), 103);
+    resized3.write(0, 'data', 203);
+    resized3.resize(4, 303);
+    @assert(resized3.getTime() == 303);
+
+    root.addChild('deleteme', Node(), 104);
+    root.deleteChild('deleteme', 105);
+
+    # Verify that we can replay the changes.
+    newRoot := Tree(nodeStore, 'master').getRoot();
+    @assert(newRoot.getTime() == 105);
+    @assert(newRoot.getChild('file').getTime() == 200);
+    @assert(resized1.getTime() == 301);
+    @assert(resized2.getTime() == 302);
+    @assert(resized3.getTime() == 303);
+}
+
+# TODO:
+#   - create a directory and then a child node to verify that when we do
+#     addChild() on a node without a digest the change propagates back to the
+#     parent.
+
+cerr `ok\n`;

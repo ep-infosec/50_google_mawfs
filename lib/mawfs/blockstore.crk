@@ -1,0 +1,823 @@
+# Copyright 2016 Google Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+## Low-level block-store API.
+
+#import crack.exp.fuse fuseMain = main, LockedFilesystem, NodeImpl;
+import crack.cont.array Array;
+import crack.cont.hashmap HashMap;
+import crack.enc.base64 altDecode, altEncode;
+import crack.hash Hash;
+import crack.hash.sha256 SHA256;
+import crack.io Formatter, StringReader, SEEK_SET;
+import crack.lang cmp, makeHashVal, AppendBuffer, Buffer, Exception,
+    FreeBase, InvalidArgumentError, ManagedBuffer, SystemError;
+import crack.logger debug;
+import crack.serial SerialReader, SerialWriter;
+import crack.runtime ENOENT;
+import crack.threads Mutex, MutexLock;
+
+import crack.fs Path;
+import crack.io FStr, Reader, StringWriter, Writer;
+
+import crack.protobuf readMessageFromString, Field, Message, ProtoWriter;
+
+import .rawchunk GeneralCallback, JournalBlock, RawChunkReader;
+import .ciphers AES256Cipher, Cipher;
+import .entropy getEntropySource;
+
+@import crack.ann interface, impl, struct;
+@import crack.protobuf.ann protobuf;
+
+const MAX_NODE_SIZE := 1024 * 1024;
+
+const int
+    MODE_DIR = 1,   # A directory.
+    MODE_EXE = 2;   # Set the executable flag.
+
+@protobuf {
+    version = 1
+
+    ## A filesystem entry.  Nodes can either be directories or blobs.
+    ## Directories have a mode of MODE_DIR and their entries all have name
+    ## attributes.  Blobs do not have MODE_DIR and their entries all have
+    ## sizes, the size being the total size of the contents of the subtree
+    ## under that entry.
+    message Entry {
+        ## The sha256 hash of the encrypted object.
+        optional bytes hash = 1;
+
+        ## The name of the object (for a directory entry).
+        optional string name = 2;
+
+        ## The 32 bit checksum of the original file (calculated by adding
+        ## bytes).
+        optional int32 org_checksum = 3;
+
+        ## The size of the total contents of the subtree (for a blob entry).
+        optional uint64 size = 4;
+    }
+
+    ## A filesystem node.  MAWFS is agnostic to the difference between files
+    ## and directories.  A MAWFS node can contain both named entries and
+    ## contents.
+    message Node {
+        required int32 checksum = 1;
+        optional string contents = 2;
+
+        ## 'size' is the size of the data in all children.
+        optional uint64 size = 4;
+        repeated Entry children = 3;
+
+        ## See the MODE_* constants above.  'mode' should be present for all
+        ## top-level file nodes and directory nodes.
+        optional int32 mode = 5;
+
+        ## Last modification time in seconds since the epoch.
+        optional int32 time = 6;
+    }
+
+    ## User-provided metadata that is associated with a commit.
+    message CommitMetadata {
+        ## A user-provided commit comment.
+        optional string comment = 1;
+
+        ## A user-provided identifier of the committer of the change.  Should
+        ## generally consist of a standard e-mail address, e.g.
+        ## "John Doe" <jdoe@example.com>
+        optional string committer = 2;
+    }
+
+    ## A commit.  These objects track the history of an entire filesystem.
+    message Commit {
+        ## The digest of the "parent" commits.  There should generally be one
+        ## of these.
+        ## The first tree of the filesystem will have no parents.
+        ## A "merge" commit (which merges two filesystems) will have more than
+        ## one parent.
+        repeated bytes parent = 1;
+
+        ## The digest of the root of the filesystem at the point of the commit.
+        optional bytes root = 2;
+
+        ## The digest of a node containing the set of journal ids for the
+        ## journal that preceded this commit.
+        optional bytes journalInfo = 3;
+
+        ## The digest of a node containing the complete journal for this
+        ## commit.  The implementation must not rely either on this field
+        ## being present or the referenced journal being accessible.
+        optional bytes journal = 4;
+
+        ## Commit time, in seconds since the epoch.
+        optional int32 timestamp = 5;
+
+        ## User-provided commit metadata.  THis is only present if the user
+        ## provided it from a commit RPC.
+        optional CommitMetadata metadata = 6;
+    }
+
+    ## Change is like a lightweight Commit for purposes of storing changes in
+    ## the filesystem journal.
+    message Change {
+        ## Types are the CHANGE_* constants.
+        required int32 type = 1;
+
+        ## List of child indexes representing a path to the node to be
+        ## modified.
+        repeated int32 path = 10;
+
+        ## Specified for CHANGE_REPLACE_CHILD to indicate the index of the
+        ## child to replace (would be the last element of 'path', but it's
+        ## just easier to work with as a separate attribute).
+        optional int32 index = 13;
+
+        ## Child name.
+        optional string name = 2;
+
+        ## Node to be added.
+        optional Node node = 3;
+
+        ## Change to be applied to a nested child (should be another Changes
+        ## message).
+        optional bytes nested = 4;
+
+        ## Position to insert data into for a write.
+        optional uint64 pos = 5;
+
+        ## Data to be inserted in a write.
+        optional bytes data = 6;
+
+        ## New size of the node for a resize.
+        optional uint64 newSize = 7;
+
+        ## The digest of the last Change.  Every change should have this
+        ## except for the first change after a commit, which should have a
+        ## 'commit' field.
+        optional bytes lastChange = 8;
+
+        ## The commit that this change should be applied to.  Only the first
+        ## change after a commit should have this field, all others should
+        ## have 'lastChange' instead.
+        optional bytes commit = 9;
+
+        ## A random nonce values that is applied to a sequence of changes
+        ## emitted by a peer during a single session, during which the
+        ## journal may only be modified by the peer.
+        optional bytes sessionId = 11;
+
+        ## The node digest (this may be specified instead of "node" for cases
+        ## where a committed node is being added).
+        optional bytes digest = 12;
+
+        ## The last modification time of the node.
+        optional int32 time = 14;
+
+        # last tag: 14
+    }
+}
+
+String hashFile(Path file) {
+    src := file.makeFullReader();
+    hasher := SHA256();
+    buffer := ManagedBuffer(4096);
+    uint64 size;
+#    while (rc := src.read(buffer)) {
+#        size += rc;
+#        cout `\r$size\033[k`;
+#        hasher.update(buffer);
+#    }
+    hasher.update(src.readAll());
+    return hasher.digest();
+}
+
+## A chunk is the basic unit of data in MAWFS.  We store its content and
+## the digest of its encrypted representation.
+class Chunk {
+    String contents;
+    String digest;
+
+    oper init(String contents, String digest) :
+        contents = contents,
+        digest = digest {
+    }
+}
+
+# Size of blocks to read and write.
+const BLOCK_SIZE := 65536;
+
+class BadDigestError : Exception {
+    oper init() {}
+    oper init(String message) : Exception(message) {}
+}
+
+class HashAndWrite @impl Writer {
+
+    Hash hasher;
+    Writer dst;
+
+    oper init(Hash hasher, Writer dst) :
+        hasher = hasher,
+        dst = dst {
+    }
+
+    void write(Buffer data) {
+        hasher.update(data);
+        dst.write(data);
+    }
+
+    String getDigest() { return hasher.digest(); }
+}
+
+## Information on a MAWFS filesystem.
+class FSInfo {
+    Cipher cipher;
+
+    ## Legacy constructor, uses AES256 cipher.
+    oper init(String password) : cipher = AES256Cipher(password) {}
+
+    oper init(Cipher cipher) : cipher = cipher {}
+
+    ## Reads a "Chunk" from a Reader.  A chunk is the basic unit of data.  The
+    ## reader is assumed to be an encrypted stream
+    Chunk readChunk(Reader src) {
+        hasher := SHA256();
+        tmp := StringWriter();
+        while (data := src.read(BLOCK_SIZE)) {
+            hasher.update(data);
+            tmp.write(data);
+        }
+
+        return Chunk(cipher.decrypt(tmp.string()), hasher.digest());
+    }
+
+    ## Writes and encrypts raw chunk data, returns the digest of the encrypted
+    ## data.
+    String writeChunk(Writer dst, Buffer data) {
+        ciphertext := cipher.encrypt(data);
+        dst.write(ciphertext);
+        hasher := SHA256();
+        hasher.update(ciphertext);
+        return hasher.digest();
+    }
+
+    ## Writes and encrypts a chunk and verifies the digest.  If the digest
+    ## doesn't match that of the chunk, throws a BadDigestError.
+    void writeChunk(Writer dst, Chunk chunk) {
+        if (writeChunk(dst, chunk.contents) != chunk.digest)
+            throw BadDigestError();
+    }
+}
+
+class ChangeEntry {
+    String digest;
+    Change change;
+
+    oper init(String digest, Change change) :
+        digest = digest,
+        change = change {
+    }
+}
+
+@interface JournalIter {
+    @abstract ChangeEntry elem();
+    @abstract void next();
+
+    JournalIter iter() { return this; }
+}
+
+## Manages the session id for a branch.
+class Session {
+    String __id;
+
+    void reset() {
+        __id = getEntropySource().getString(8);
+    }
+
+    oper init() {
+        reset();
+    }
+
+    String getId() {
+        return __id;
+    }
+
+    ## Lets unit tests set the session id.
+    void setId(String id) { __id = id }
+}
+
+## Interface for partial chunk stores that can load chunks from remote sources.
+@interface RemoteReader {
+    ## Returns the contents of the object with the named digest, returns null
+    ## if unable to obtain it for any reason.
+    @abstract String getContents(String digest);
+}
+
+## A set of Nodes and Commits ("chunks", or rather, of chunk digests).
+@interface ChunkSet {
+
+    ## Add the digest to the node set.
+    @abstract void add(String digest);
+
+    ## Returns true if the set includes the digest.
+    @abstract bool has(String digest);
+}
+
+## Interface for a node store.
+@interface NodeStore {
+
+    ## Set the remote reader for the store.  The remote reader is used to
+    ## attempt to obtain blocks that can not be discovered locally.
+    @abstract void setRemoteReader(RemoteReader remoteReader);
+
+    ## Store a chunk, return its digest.
+    @abstract String storeNode(Node node);
+
+    ## Compute and return the digest for the node.  This is just like
+    ## storeNode() only it doesn't store the node, it just creates its digest.
+    @abstract String makeDigest(Node node);
+
+    ## Get the node at the given digest, null if it's not currently stored.
+    @abstract Node getNode(String digest);
+
+    ## Mix-in to allow status to be passed back with persisted objects.
+    class ChunkStatus : FreeBase {
+        ## Set to true if the node was loaded from a remote source.
+        bool remote;
+    }
+
+    ## Bundles a node and status information.
+    class NodeAndStatus : Node, ChunkStatus {}
+
+    ## Get the node at the given digest and information on where we got it
+    ## from, null iif it's not currently stored.
+    @abstract NodeAndStatus getNodeAndStatus(String digest);
+
+    ## Stores a Commit, returns its digest.
+    @abstract String storeCommit(Commit commit);
+
+    ## Retrieves a commit object from its digest, null if it's not currently
+    ## stored.
+    @abstract Commit getCommit(String digest);
+
+    ## Bundles a Commit and status information.
+    class CommitAndStatus : Commit, ChunkStatus {}
+
+    ## Retrieves a commit object and status information from its digest, null
+    ## if it's not currently stored.
+    @abstract CommitAndStatus getCommitAndStatus(String digest);
+
+    ## Returns the digest of the head commit of a given branch.   Returns
+    ## null if the branch is not defined.
+    @abstract String getHead(String branch);
+
+    ## Sets the digest of the head commit for the branch.
+    @abstract void setHead(String branch, String digest);
+
+    ## Delete the head commit for the branch.
+    @abstract bool deleteHead(String branch);
+
+    ## Write a change to the journal for the branch.  Returns the digest of
+    ## the change.
+    @abstract String writeToJournal(String branch, Change change);
+
+    ## Delete the journal for a branch.
+    @abstract void deleteJournal(String branch);
+
+    ## Return an iterator over the journal
+    @abstract JournalIter makeJournalIter(String branch);
+
+    ## Returns the size of the journal, or rather, the size of all of the
+    ## changes in it.
+    @abstract uint getJournalSize(String branch);
+
+    ## Invalidate the session id for a given branch.  This must be called
+    ## whenever the journal is retrieved from a remote peer into a
+    ## non-tracking branch. Invalidating the session id ensures that any
+    ## subsequent changes to the branch will be recorded separately in a
+    ## commit.
+    @abstract void invalidateSession(String branch);
+
+    ## Gets the session object for the branch, creating a new one if necessary.
+    @abstract Session getSession(String branch);
+
+    @struct RepoInfo {
+        String rootDigest;
+        String firstCommitDigest;
+    }
+
+    ## Convenience method to create a new repository in the node store.
+    @final RepoInfo createRepository(String branch) {
+        # Create an empty root node.
+        rootNode := Node();
+        rootNode.mode = MODE_DIR;
+        rootDigest := storeNode(rootNode);
+
+        # Store the first commit under "master".
+        commit := Commit();
+        commit.root = rootDigest;
+        commitDigest := storeCommit(commit);
+        setHead(branch, commitDigest);
+
+        return RepoInfo(rootDigest, commitDigest);
+    }
+
+
+    ## Returns the set of nodes that are known to be traversed.  A block store
+    ## may choose not to implement this, in which case it should return null.
+    ## May return null.
+    @abstract ChunkSet getTraversed();
+}
+
+class FSRawChunkReader @impl RawChunkReader {
+    Path __dir;
+    Mutex __mutex;
+    NodeStore __store;
+
+    oper init(Path dir, Mutex mutex, NodeStore store) :
+        __dir = dir, __mutex = mutex, __store = store {
+    }
+
+    void readRawChunk(String digest, GeneralCallback[String] callback) {
+        MutexLock lock = __mutex ? MutexLock(__mutex) : null;
+        path := __dir/'objects'/altEncode(digest);
+        if (path.exists()) {
+            result := path.readAll();
+            lock = null;
+            callback(result, null);
+        } else {
+            callback(null, null);
+        }
+    }
+
+    void getHead(String branch, GeneralCallback[String] callback) {
+        MutexLock lock = __mutex ? MutexLock(__mutex) : null;
+        path := __dir/'refs'/branch;
+        if (path.exists() && !path.isDir()) {
+            result := altDecode(path.readAll());
+            lock = null;
+            callback(result, null);
+        } else {
+            callback(null, null);
+        }
+    }
+
+    void getJournalBlock(String firstBlockDigest, String branch, uint pos,
+                         GeneralCallback[JournalBlock] callback
+                         ) {
+        MutexLock lock = __mutex ? MutexLock(__mutex) : null;
+        path := __dir/'journals'/branch;
+        if (!path.exists()) {
+            callback(JournalBlock(null, null, true), null);
+            return;
+        }
+
+        # If we're getting the first block, and the journal is smaller than
+        # the block size, just give back the first block.
+        journalSize := path.getStat().st_size;
+        if (journalSize <= BLOCK_SIZE) {
+            __store.invalidateSession(branch);
+            if (pos == 0) {
+                callback(JournalBlock(null, path.readAll(), true), null);
+            } else {
+                # The user is requesting a block from beyond the end of the
+                # journal.
+                callback(JournalBlock(null, null, true), null);
+            }
+            return;
+        }
+
+        src := path.reader();
+
+        # The journal is larger than a block.
+        # If the user specified a first block digest, verify that it matches
+        # that of the current journal.
+        if (firstBlockDigest) {
+            firstBlock := src.read(BLOCK_SIZE);
+            hasher := SHA256();
+            hasher.update(firstBlock);
+            digest := hasher.digest();
+            if (digest != firstBlockDigest) {
+                callback(JournalBlock(null, null, true), null);
+                return;
+            }
+        }
+
+        # Finally, try to read the block requested by the user.
+        src.seek(int32(pos), SEEK_SET);
+        data := src.read(BLOCK_SIZE);
+        lastBlock := journalSize - pos <= BLOCK_SIZE;
+        if (lastBlock)
+            __store.invalidateSession(branch);
+        callback(JournalBlock(firstBlockDigest, data, lastBlock),
+                 null
+                 );
+    }
+
+    void getFile(String filename, GeneralCallback[String] callback) {
+        path := __dir/filename;
+        if (path.exists()) {
+            callback(path.readAll(), null);
+        } else {
+            callback(null, SystemError(FStr() `File "$filename" not found`,
+                                       ENOENT
+                                       )
+                     );
+        }
+    }
+}
+
+## Lets you store and load chunks from a persistent back-end.
+## This is currently implemented as a thin wrapper around a directory, but it
+## should eventually be an interface wrapping any place fine chunks are
+## stored.
+class ChunkStore @impl NodeStore {
+
+    Path __dir;
+    FSInfo __fsInfo;
+    RemoteReader __remote;
+    HashMap[String, Session] __sessions = {};
+
+    oper init(Path dir, FSInfo fsInfo) : __dir = dir, __fsInfo = fsInfo {}
+
+    ## Returns the cipher used to encrypt/decrypt chunks from the store.
+    Cipher getCipher() { return __fsInfo.cipher }
+
+    void setRemoteReader(RemoteReader remote) { __remote = remote }
+
+    ## Returns the chunk for the digest or null.
+    ## status is nullable, if provided status is assigned.
+    Chunk __loadChunk(String digest, ChunkStatus status) {
+        path := __dir/'objects'/altEncode(digest);
+        Reader src;
+        String remoteContents;
+        if (path.exists()) {
+            src = path.reader();
+        } else {
+            if (!__remote || !(remoteContents = __remote.getContents(digest)))
+                return null;
+            src = StringReader(remoteContents);
+        }
+
+        result := __fsInfo.readChunk(src);
+        if (result.digest != digest)
+            throw BadDigestError(
+                FStr() I`chunk $(altEncode(digest)) data integrity failure.
+                         Actual data digest is $(altEncode(result.digest))`
+            );
+
+        # Store locally if we retrieved this from the remote reader.
+        if (remoteContents) {
+            path.parent().makeDirs();
+            path.writeAll(remoteContents);
+            if (!(status is null))
+                status.remote = true;
+        } else if (!(status is null)) {
+            status.remote = false;
+        }
+        return result;
+    }
+
+    ## Loads the chunk with the specified digest into 'msg' and returns true,
+    ## returns false if the chunk doesn't exist in the store.
+    ##
+    ## Verifies the chunk digest on read, throws BadDigestError if it doesn't
+    ## match.
+    Chunk load(String digest) {
+        return __loadChunk(digest, null);
+    }
+
+    ## Load the chunk from 'digest' into 'msg'.
+    ## status is nullable, used to pass back remote/local status if defined.
+    bool __load(String digest, Message msg, ChunkStatus status) {
+        chunk := __loadChunk(digest, status);
+        if (!chunk)
+            return false;
+        readMessageFromString(msg, chunk.contents);
+        return true;
+    }
+
+    Path __objectsDir() {
+        objectsDir := __dir/'objects';
+        if (!objectsDir.exists())
+            objectsDir.makeDir();
+        return objectsDir;
+    }
+
+    ## Store the chunk.
+    ##
+    ## Verifies the chunk digest on write, throws BadDigestError if it doesn't
+    ## match.
+    void store(Chunk chunk) {
+        path := __objectsDir()/altEncode(chunk.digest);
+        __fsInfo.writeChunk(path.writer(), chunk);
+    }
+
+    ## Stores a chunk without a hash.  Returns the digest.
+    String store(Buffer data) {
+        path := __objectsDir()/(FStr() `tempchunk.$(uintz(data))`);
+        digest := __fsInfo.writeChunk(path.writer(), data);
+        path.moveTo(__objectsDir()/altEncode(digest));
+        return digest;
+    }
+
+    Node getNode(String digest) {
+        Node node = {};
+        return __load(digest, node, null) ? node : null;
+    }
+
+    NodeAndStatus getNodeAndStatus(String digest) {
+        NodeAndStatus node = {};
+        return __load(digest, node, node) ? node : null;
+    }
+
+    ## Stores the node, returns its digest.
+    String storeNode(Node node) {
+        return store(node.toString());
+    }
+
+    String makeDigest(Node node) {
+        class NullWriter @impl Writer {
+            void write(Buffer data) {}
+            void flush() {}
+        }
+        return __fsInfo.writeChunk(NullWriter(), node.toString());
+    }
+
+    Commit getCommit(String digest) {
+        Commit commit = {};
+        return __load(digest, commit, null) ? commit : null;
+    }
+
+    CommitAndStatus getCommitAndStatus(String digest) {
+        CommitAndStatus commit = {};
+        return __load(digest, commit, commit) ? commit : null;
+    }
+
+    String storeCommit(Commit commit) {
+        return store(commit.toString());
+    }
+
+    String writeToJournal(String branch, Change change) {
+        journalDir := __dir/'journals';
+        if (!journalDir.exists())
+            journalDir.makeDirs();
+        journalFile := journalDir/branch;
+        Writer writer;
+        if (journalFile.exists())
+            writer = journalFile.appender();
+        else
+            writer = journalFile.writer();
+        dst := SerialWriter(writer);
+
+        # Encrypt the data into the buffer.
+        StringWriter tmp = {};
+        digest := __fsInfo.writeChunk(tmp, change.toString());
+
+        # We can just write this directly to the SerialWriter.
+        dst.write(tmp);
+
+        return digest;
+    }
+
+    void deleteJournal(String branch) {
+        file := __dir/'journals'/branch;
+        if (file.exists())
+            file.delete();
+    }
+
+    class __JIter @impl JournalIter {
+        SerialReader __src;
+        ChangeEntry __cur;
+        FSInfo __fsInfo;
+
+        void __readOne() {
+
+            # Read the next entry, we're done if we run out of data.
+            buf := __src.readString(false);
+            if (!buf) {
+                __cur = null;
+                return;
+            }
+
+            chunk := __fsInfo.readChunk(StringReader(buf));
+            Change change = {};
+            readMessageFromString(change, chunk.contents);
+            __cur = ChangeEntry(chunk.digest, change);
+        }
+
+        oper init(Reader src, FSInfo fsInfo) : __src(src), __fsInfo = fsInfo {
+            __readOne();
+        }
+        ChangeEntry elem() { return __cur }
+        void next() { __readOne(); }
+        bool isTrue() { return __cur }
+    }
+
+    class __NullJIter @impl JournalIter {
+        ChangeEntry elem() { return null }
+        void next() {}
+        bool isTrue() { return false }
+    }
+
+    JournalIter makeJournalIter(String branch) {
+        src := __dir/'journals'/branch;
+        if (!src.exists())
+            return __NullJIter();
+        return __JIter(src.reader(), __fsInfo);
+    }
+
+    uint getJournalSize(String branch) {
+        src := __dir/'journals'/branch;
+        if (!src.exists())
+            return 0;
+        else
+            return uint(src.getSize());
+    }
+
+    void invalidateSession(String branch) {
+        if (ses := __sessions.get(branch))
+            ses.reset();
+    }
+
+    Session getSession(String branch) {
+        ses := __sessions.get(branch);
+        if (!ses)
+            __sessions[branch] = ses = Session();
+        return ses;
+    }
+
+    Array[String] getJournalEntries(String digest) {
+        return null;
+    }
+
+    String getHead(String branch) {
+        branchFile := __dir/'refs'/branch;
+        if (!branchFile.exists())
+            return null;
+        return altDecode(branchFile.readAll());
+    }
+
+    void setHead(String branch, String digest) {
+        branchFile := __dir/'refs'/branch;
+        if (!branchFile.parent().exists())
+            branchFile.parent().makeDirs();
+        branchFile.writeAll(altEncode(digest));
+    }
+
+    bool deleteHead(String branch) {
+        branchFile := __dir/'refs'/branch;
+        if (!branchFile.exists())
+            return false;
+        branchFile.delete();
+        return true;
+    }
+
+    ## Returns a RawChunkReader for the blockstore.  The mutex is locked prior
+    ## to doing any reads, allowing us to coordinate reads with the rest of
+    ## the system.  It may be null if coordination is not an issue.
+    RawChunkReader getRawChunkReader(Mutex mutex) {
+        return FSRawChunkReader(__dir, mutex, this);
+    }
+
+    ## Implements a chunk set as a directory full of file names.
+    class TraversedChunkDB @impl ChunkSet {
+        Path __dir;
+
+        oper init(Path backing) : __dir = backing/'traversed' {}
+
+        bool has(String digest) {
+            return (__dir/altEncode(digest)).exists();
+        }
+
+        void add(String digest) {
+            if (!__dir.exists())
+                __dir.makeDir();
+            (__dir/altEncode(digest)).writeAll('');
+        }
+    }
+
+    ChunkSet getTraversed() {
+        return TraversedChunkDB(__dir);
+    }
+
+    ## Store an entire directory in the blockstore.  Returns its digest.
+#    String storeDir(Path root) {
+#        files := Array[Entry]![];
+#        for (file :in root.children()) {
+#            if (file.isDir()) {
+#                storeDir(file);
+#            } else {
+#                files.append(Entry
+}

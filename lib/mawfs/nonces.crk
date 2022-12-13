@@ -1,0 +1,69 @@
+
+import crack.cont.array Array;
+import crack.threads Mutex, MutexLock;
+import .entropy getEntropySource;
+
+const int
+    ## Maximum number of nonces that we retain at any given time.
+    MAX_NONCES = 12,
+
+    ## Size of a nonce in bytes.
+    NONCE_SIZE = 32;
+
+
+## Manages a set of "nonce" tokens, which are randomly generated and can be
+## redeedmed only once.
+##
+## These are intended to be used for the user authentication mechanism: they
+## allow a user with access to the FUSE mounted filesystem to obtain a token
+## allowing them to authenticate against the socket interface.
+##
+## Instances are threadsafe.
+class NonceManager {
+
+    ## The currently active nonces.  We keep a set of these around to avoid
+    ## a race condition where a client gets a nonce but then another client
+    ## gets a nonce before the first can redeem theirs.
+    Array[String] __nonces = {};
+    Mutex __mutex = {};
+
+    ## Returns a new nonce and records it for future redemption.
+    String get() {
+        lock := MutexLock(__mutex);
+        result := getEntropySource().getString(NONCE_SIZE);
+        __nonces.append(result);
+
+        # Clean up expired nonces.
+        if (__nonces.count() > MAX_NONCES)
+            __nonces.delete(0);
+
+        return result;
+    }
+
+    ## "Redeems" a nonce, returning true if the nonce is valid and removing it
+    ## from the set of available nonces.
+    bool redeem(String nonce) {
+        lock := MutexLock(__mutex);
+        for (cur :on __nonces) {
+            if (cur.elem() == nonce) {
+                __nonces.delete(cur.index);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    ## Returns the remainder of the nonce identified by 'prefix' and redeems
+    ## the nonce.  Returns null if the nonce does not exist.
+    String redeemPrefix(String prefix) {
+        lock := MutexLock(__mutex);
+        for (cur :on __nonces) {
+            nonce := cur.elem();
+            if (nonce.startsWith(prefix)) {
+                __nonces.delete(cur.index);
+                return nonce.substr(prefix.size);
+            }
+        }
+        return null;
+    }
+}

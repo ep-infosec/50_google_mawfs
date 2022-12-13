@@ -1,0 +1,408 @@
+# Copyright 2016 Google Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+## Filesystem Path adapter.
+module;
+
+import crack.runtime EACCES, ENOENT, ENOTDIR;
+import crack.fs Path, PathIter, PathStat;
+import crack.functor Functor2;
+import crack.io Formatter, FStr, SeekableReader, SeekableWriter, SEEK_CUR,
+    SEEK_END, SEEK_SET;
+import crack.lang Buffer, Exception, FieldSet, InvalidArgumentError,
+    InvalidStateError, WriteBuffer, SystemError;
+import crack.logger debug;
+import crack.runtime S_IFDIR, S_IFREG;
+import crack.time Time;
+import mawfs.blockstore Node, MODE_DIR, MODE_EXE;
+import mawfs.cache getPosixTime, CachedNode;
+
+@import crack.ann impl, implements, interface;
+@import crack.fieldset_ann fieldset_accessors;
+
+## RWPath extends the interface of crack.fs.Path to random-access read and
+## write operations.
+@abstract class RWPath : Path {
+
+    ## Write the data at the given position in the file.  If 'pos' is out of
+    ## range, or the node is not a file, the behavior is undefined.
+    @abstract void write(uint pos, Buffer data);
+
+    ## Try to read 'data.cap' bytes from the file at pos.  If 'pos' is out of
+    ## range, this should return an empty buffer.  If the node is not a file,
+    ## the behavior is undefined.
+    @abstract void read(uint pos, WriteBuffer data);
+}
+
+@abstract class AdminDirFactory @impl Functor2[Path, CachedNode, String] {
+    @fieldset_accessors(AdminDirFactory);
+}
+
+class _Seekable {
+    int64 _pos;
+    RWPath _path;
+
+    oper init(RWPath path) : _path = path {}
+
+    @final int64 _seek(int64 offset, int whence) {
+        if (whence == SEEK_CUR)
+            _pos = offset;
+        else if (whence == SEEK_END)
+            _pos = int64(_path.getSize()) + offset;
+        else if (whence == SEEK_SET)
+            _pos = offset;
+        else
+            throw InvalidArgumentError();
+
+        return _pos;
+    }
+}
+
+class RWPathAppender : _Seekable @implements SeekableWriter {
+
+    void flush() {}
+
+    oper init(RWPath path) : _Seekable(path) {}
+
+    void write(Buffer data) {
+        _path.write(_pos, data);
+        _pos += int64(data.size);
+    }
+
+    int64 seek(int64 offset, int whence) {
+        return _seek(offset, whence);
+    }
+
+    int64 tell() { return _pos }
+}
+
+class RWPathReader : _Seekable @implements SeekableReader {
+
+    oper init(RWPath path) : _Seekable(path) {}
+
+    int64 seek(int64 offset, int whence) {
+        return _seek(offset, whence);
+    }
+
+    int64 tell() { return _pos }
+
+    uint read(WriteBuffer buffer) {
+        _path.read(_pos, buffer);
+        _pos += int64(buffer.size);
+        return buffer.size;
+    }
+}
+
+Path _makeMAWFSPath(CachedNode node, Path parent, String name);
+
+class MAWFSIter : PathIter {
+    Path __path;
+    CachedNode __node;
+    int i;
+
+    oper init(Path path, CachedNode node) :
+        __path = path,
+        __node = node {
+        __node.addExtRef();
+    }
+
+    oper del() {
+        __node.releaseExtRef();
+    }
+
+    bool next() {
+        if (i < __node.getChildCount()) {
+            ++i;
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    Path elem() {
+        return _makeMAWFSPath(__node.getChild(i), __path,
+                              __node.getChildName(i)
+                              );
+    }
+
+    bool isTrue() {
+        return i < __node.getChildCount();
+    }
+}
+
+class MAWFSPath : RWPath {
+
+    ## The underlying cached node.  This may be null if the file does not
+    ## exist.
+    CachedNode __rep;
+
+    MAWFSPath __parent;
+    String __name;
+    bool __readonly;
+
+    oper init(CachedNode rep) : __rep = rep, __name = '' {
+        if (__rep)
+            __rep.addExtRef();
+    }
+
+    oper init(CachedNode rep, bool readonly) :
+        __rep = rep,
+        __name = '',
+        __readonly = readonly {
+        if (__rep)
+            __rep.addExtRef();
+    }
+
+    oper init(CachedNode rep, MAWFSPath parent, String name) :
+        __rep = rep,
+        __parent = parent,
+        __name = name,
+        __readonly = parent ? parent.__readonly : false {
+        if (__rep)
+            __rep.addExtRef();
+    }
+
+    oper del() {
+        if (__rep)
+            __rep.releaseExtRef();
+    }
+
+    @final void __checkMutable() {
+        if (__readonly)
+            throw SystemError('Readonly filesystem', EACCES);
+    }
+
+    SeekableWriter appender() {
+        __checkMutable();
+        return RWPathAppender(this);
+    }
+
+    void __checkExists() {
+        if (__rep is null)
+            throw SystemError('File does not exist', ENOENT);
+    }
+
+    PathIter children() {
+        __checkExists();
+        if (__rep.getMode() & MODE_DIR)
+            return MAWFSIter(this, __rep);
+        else
+            throw SystemError('Node is not a directory', ENOTDIR);
+    }
+
+    void delete() {
+        __checkMutable();
+        __parent.__rep.deleteChild(__name, getPosixTime());
+        __rep.releaseExtRef();
+        __rep = null;
+    }
+
+    bool exists() {
+        return __rep;
+    }
+
+    int getAccessTime() { return 0 }
+
+    int getCreateTime() { return 0 }
+
+    String getFullName() {
+        return FStr() `$(__parent ? __parent.getFullName() : '')/$__name`;
+    }
+
+    int getModTime() {
+        __checkExists();
+        return __rep.getTime();
+    }
+
+    void setModTime(int32 time) {
+        __checkMutable();
+        __rep.setTime(time);
+    }
+
+    int getMode() { return 0 }
+
+    String getName() { return __name }
+
+    uint64 getSize() {
+        __checkExists();
+        return __rep.getSize();
+    }
+
+    PathStat getStat() {
+        __checkExists();
+        PathStat stat = {};
+
+        # The only attributes for the underlying filesystem are "directory"
+        # and "executable".  Everything else is a normal file.
+        # TODO: Make permissions configurable at the cache level.
+        if (__rep.isDir())
+            stat.st_mode = 0755 | S_IFDIR;
+        else if (__rep.getMode() & MODE_EXE)
+            stat.st_mode = 0755 | S_IFREG;
+        else
+            stat.st_mode = 0644 | S_IFREG;
+
+        # TODO: change this to the user/group that started the server.
+        stat.st_uid = 0;
+        stat.st_gid = 0;
+        stat.st_nlink = 1;
+        return stat;
+    }
+
+    bool isDir() {
+        if (!__rep)
+            return false;
+        return __rep.isDir();
+    }
+
+    bool isExecutable() {
+        if (!__rep)
+            return false;
+        return __rep.getMode() & MODE_EXE;
+    }
+
+    bool isLink() { return false }
+
+    void makeDir(bool errorOnExists) {
+        __checkMutable();
+        if (__rep) {
+            if (__rep.isDir() && !errorOnExists)
+                return;
+            throw SystemError(FStr() `$(getFullName()) already exists`);
+        }
+
+        time := getPosixTime();
+        node := Node();
+        node.mode = MODE_DIR;
+        node.time = time;
+        __rep = __parent.__rep.addChild(__name, node, time);
+        __rep.addExtRef();
+    }
+
+    void makeDirs() {}
+
+    SeekableReader reader() {
+        __checkExists();
+        return RWPathReader(this);
+    }
+
+    SeekableWriter writer() {
+        __checkMutable();
+        if (__rep) {
+            if (__rep.isDir())
+                throw SystemError(FStr() I`Can not write to directory \
+                                           $(getFullName())`
+                                  );
+            __rep.resize(0, getPosixTime());
+        } else if (__parent) {
+            # Create a new node.
+            parentRep := __parent.__rep;
+            time := getPosixTime();
+            node := Node();
+            node.time = time;
+            __rep = parentRep.addChild(__name, node, time);
+            __rep.addExtRef();
+        } else {
+            # The root path should have been created with a cached node.
+            throw Exception('Root has no cached node!');
+        }
+        return RWPathAppender(this);
+    }
+
+    Path parent() { return __parent }
+
+    void truncate(uint64 newSize) {
+        __checkMutable();
+        __checkExists();
+        __rep.resize(newSize, getPosixTime());
+    }
+
+    void moveTo(Path other) {
+        __checkMutable();
+        o := MAWFSPath.cast(other);
+        newParent := o.__parent;
+        __parent.__rep.deleteChild(__name, getPosixTime());
+        newParent.__rep.addChild(other.getName(), __rep, getPosixTime());
+        o.__rep = __rep;
+        __rep = null;
+    }
+
+    Path oper [](String child) {
+        __checkExists();
+
+        if (isDir() && child == '.mawfs' &&
+            factory := AdminDirFactory.get(__rep.getContext()))
+            return factory(__rep.getRoot(), '.mawfs');
+
+        childNode := __rep.getChild(child);
+        return MAWFSPath(childNode, this, child);
+    }
+
+    Path _createNode(String  path) { return null }
+
+    Path oper /(String other) {
+        return this[other];
+    }
+
+    void setMode(int mode) {}
+
+    Path moveToDir(Path other) { return null }
+
+    void write(uint pos, Buffer data) {
+        __checkMutable();
+        __checkExists();
+        if (__rep.isDir())
+            throw InvalidStateError(
+                FStr() `File $(getFullName()) is a directory.`);
+
+        __rep.write(pos, data, getPosixTime());
+    }
+
+    void read(uint pos, WriteBuffer data) {
+        __checkExists();
+        __rep.read(pos, data);
+    }
+
+    void formatTo(Formatter out) {
+        out `Path for $__rep`;
+    }
+
+    ## Returns the underlying cached node.
+    CachedNode getCachedNode() { return __rep }
+
+    void __resetTo(MAWFSPath path) {
+        __rep = path.getCachedNode();
+        if (__parent)
+            __parent.__resetTo(path.__parent);
+    }
+
+    ## Reset the underlying cache node against the new filesystem root.
+    ## This gets called when the tree gets reset out from under us.
+    ## We just have to do the sanest thing we can here.
+    void reset(CachedNode root) {
+        Path resolve(MAWFSPath org, CachedNode root) {
+            if (!org.__parent)
+                return MAWFSPath(root, false);
+            return resolve(org.__parent, root)[org.getName()];
+        }
+
+        # reconstitute the root path.
+        curNode := MAWFSPath.cast(resolve(this, root));
+        __resetTo(curNode);
+    }
+}
+
+Path _makeMAWFSPath(CachedNode node, Path parent, String name) {
+    return MAWFSPath(node, MAWFSPath.cast(parent), name);
+}

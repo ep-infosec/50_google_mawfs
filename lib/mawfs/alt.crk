@@ -1,0 +1,109 @@
+# Copyright 2016 Google Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+## Module containing the "alt" filesystem container, which is a map of branch
+## names to filesystems representing the head of the branch.
+
+import crack.cont.treemap TreeMap;
+import crack.fs Path;
+import crack.lang Exception;
+import crack.io FStr;
+import .admin AltSourceDir, PathMap;
+import .blockstore NodeStore;
+import .cache Cache, CachedNode, Tree;
+import .path MAWFSPath;
+
+@import crack.ann impl, struct;
+
+@struct BranchInfo {
+    String name;
+    Tree tree;
+}
+
+## Encapsulates the set of branches that are currently memory resident.  This
+## gets attached to the node context for use throughout the filesystem.
+class ResidentBranches @impl AltSourceDir {
+
+    # __branches keeps track of the Tree for a loaded branch (and is also the
+    # primary indicator of whether the branch is currently resident)
+    TreeMap[String, BranchInfo] __branches = {};
+    PathMap __branchPaths = {};
+    NodeStore __store;
+    Cache __cache;
+
+    oper init(NodeStore store, Cache cache) : __store = store, __cache = cache {}
+
+    ## Returns a PathMap containing the set of branches.  Note that this
+    ## remains owned and maintained by the instance and is shared by all
+    ## owning directories, so the caller should not attempt to manage the
+    ## contents (for example, by adding new branches: makeBranchDir() does
+    ## that).
+    PathMap getBranches() {
+        return __branchPaths;
+    }
+
+    ## Make a new branch directory and add it to the set that is accessed by
+    ## getBranches().  Throws an exception if the branch already exists.
+    MAWFSPath makeBranchDir(String name) {
+        if (__branches.hasKey(name))
+            throw Exception(FStr() `Branch $name Already defined`);
+
+        # Make sure that there is already a branch of this name.
+        if (!__store.getHead(name))
+            return null;
+
+        tree := Tree(__store, __cache, name);
+        root := tree.getRoot();
+        __branches[name] = BranchInfo(name, tree);
+        __branchPaths[name] = path := MAWFSPath(tree.getRoot(), null, name);
+        return path;
+    }
+
+    ## Make a new branch directory for the specified root node.  Throws an
+    ## exception if the branch already exists.
+    void makeBranchDir(String name, CachedNode root) {
+        if (__branches.hasKey(name))
+            throw Exception(FStr() `Branch $name already defined.`);
+        tree := Tree(root);
+        __branches[name] = BranchInfo(name, tree);
+        __branchPaths[name] = path := MAWFSPath(root, null, name);
+    }
+
+    ## Returns true if the branch exists in the set of resident branches.
+    bool hasBranch(String name) {
+        return __branches.hasKey(name);
+    }
+
+    ## Returns a branch of the given name, creating it if it does not exist.
+    MAWFSPath getBranchDir(String name) {
+        if (result := __branchPaths.get(name))
+            return MAWFSPath.cast(result);
+        else
+            return makeBranchDir(name);
+    }
+
+    ## Returns the tree for the specified branch or null if it doesn't exist.
+    Tree getBranchTree(String name) {
+        if (info := __branches.get(name))
+            return info.tree;
+        else
+            return null;
+    }
+
+    ## Removes a branch dir, raises a KeyError if it doesn't exist.
+    void removeBranchDir(String name) {
+        __branches.delete(name);
+        __branchPaths.delete(name);
+    }
+}

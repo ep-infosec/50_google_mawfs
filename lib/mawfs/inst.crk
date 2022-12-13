@@ -1,0 +1,517 @@
+# Copyright 2018 Google Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import crack.cont.array Array;
+import crack.cont.hashmap HashMap;
+import crack.enc.base64 altEncode;
+import crack.fs Path;
+import crack.io FStr, Formatter, SeekableReader, SeekableWriter;
+import crack.lang cmp, makeHashVal, InvalidArgumentError, InvalidStateError;
+import crack.logger info;
+import crack.protobuf readMessageFromString, Field, Message, ProtoWriter;
+import crack.threads Mutex, MutexLock;
+
+import .admin AdminRootFactory, InfoFiles;
+import .alt ResidentBranches;
+import .blockstore CommitMetadata, Node, NodeStore, MODE_DIR;
+import .ciphers Cipher;
+import .cache CachedNode, Tree;
+import .entropy getEntropySource;
+import .merge Merger, MergeState;
+import .nonces NonceManager;
+import .path MAWFSPath;
+
+@import crack.ann define, impl, interface;
+@import crack.protobuf.ann protobuf;
+
+@protobuf {
+    version = 1
+    declare MergeState;
+
+    ## Used to store the entirety local instance state.
+    ##
+    ## The local instance state is similar to 'params', only where 'params'
+    ## contains parameters relevant to the entire cell and repository, the
+    ## instance state is specific to the current instance.
+    message LocalInstanceState {
+        optional MergeState mergeState = 1;
+
+        ## The instance name, which is used by the peer name when registering
+        ## with another instance.
+        optional string instanceName = 2;
+    }
+}
+
+class FileInfo {
+
+    ## File Handle.
+    uint64 fh;
+
+    # The underlying path object.  This may be null if either 1) the path has
+    # been invalidated or 2) The underlying object is not a MAWFSPath.
+    MAWFSPath __path;
+
+    # Reader and writer objects, may be null.
+    SeekableReader reader;
+    SeekableWriter writer;
+
+    oper init(uint64 fh, MAWFSPath path, SeekableReader reader,
+              SeekableWriter writer) :
+        fh = fh,
+        __path = path,
+        reader = reader,
+        writer = writer {
+    }
+
+    ## Invalidate the object.
+    void invalidate() {
+        reader = null;
+        writer = null;
+        __path = null
+    }
+
+    ## Reset the underlying path object relative to the new filesystem root.
+    ##
+    ## This is experimental code, see reset below.
+    void reset(CachedNode root) { if (__path) __path.reset(root) }
+}
+
+## Object that can be atteched to the filesystem, allowing the creating
+## process to inject functionality to be executed in the forked process.
+@interface UserModule {
+
+    ## Start the module.  Called during filesystem initialization.
+    @abstract void start();
+}
+
+## Manages the mutable state of the entire MAWFS instance.
+##
+## Before using any methods in this class, a client must acquire a MutexLock by
+## calling the lock() method.  The client must retain this lock for the
+## duration of its sesion with the InstanceManager.  The methods of this class
+## will throw an InvalidStateError if a lock is not active.
+class InstanceState {
+
+    # Keeps track of whether the instance is currently locked (via the mutex).
+    bool __locked;
+    Mutex __mutex;
+
+    # Current backing directory.
+    Path __backing;
+
+    # Current mountpoint.
+    Path __mountpoint;
+
+
+    Cipher __cipher;
+    String __name;
+    NodeStore __store;
+    Tree __tree;
+    HashMap[int, FileInfo] __files = {};
+
+    String __branch;
+    UserModule __userModule;
+
+    NonceManager __nonceMan = {};
+
+    # Instance wide information files.  See setInfoFile() below.
+    InfoFiles __infoFiles;
+
+    # Resident branches.  These are the branches that are accessible through
+    # the .mawfs/alt directory.  They can be created by the user with a
+    # "mkdir" or internally from other parts of the system, like RPCs.
+    ResidentBranches __branches;
+
+    # The current pending merge.
+    MergeState __pendingMerge;
+
+    # Current root path of the instance.
+    MAWFSPath __root;
+
+    class __Lock : MutexLock {
+        InstanceState __state;
+
+        oper init(Mutex mutex, InstanceState state) :
+            MutexLock(mutex),
+            __state = state {
+            __state.__locked = true;
+        }
+
+        oper del() {
+            __state.__locked = false;
+        }
+    }
+
+    ## Hook the new root node into the tree.
+    void __setRoot(CachedNode cachedRoot) {
+        # Create the set of resident branches and attach it to the root node
+        # context.
+        ctx := cachedRoot.getContext();
+        if (!__branches)
+            __branches = ResidentBranches(__store, ctx.getCache());
+        __branches.putIn(ctx);
+
+        # Store the instance information and admin root factory for the same
+        # reason.
+        __infoFiles.putIn(ctx);
+        AdminRootFactory().putIn(ctx);
+
+        __root = MAWFSPath(cachedRoot);
+    }
+
+    ## Reset the tree and the root node to the latest commit and journal on
+    ## the branch.
+    ## Do this when the journal changes from an external source (like a branch
+    ## pull).
+    void resetTree() {
+        __tree = Tree(__store, __branch);
+        cachedRoot := __tree.getRoot();
+        __setRoot(cachedRoot);
+
+        # Invalidate all open files.
+        for (entry :in __files)
+            entry.val.invalidate();
+    }
+
+    ## Reset all open files to the current tree.
+    ##
+    ## This is experimental code, and generally not ready for prime time.
+    void resetTreeAndFiles() {
+        __tree = Tree(__store, __branch);
+        cachedRoot := __tree.getRoot();
+        __setRoot(cachedRoot);
+
+        # Reset all of the file info objects.
+        for (entry :in __files)
+            entry.val.reset(__tree.getRoot());
+    }
+
+    ## Install a new root node into the instance.
+    void setRoot(CachedNode root) {
+        __tree = Tree(root);
+        __setRoot(root);
+    }
+
+    ## Constructor.
+    ##
+    ## backing: the root of the backing directory.
+    ## store: the node store
+    ## branch: the active branch name
+    ## mutex: the filesystem mutex
+    ## userModule: a user module to be started when the fuse system is
+    ##     initialized.  May be null.  The UserModule is released after the
+    ##     start() method is called, and therefore it may contain cyclic
+    ##     references to the InstanceState.
+    oper init(Path backing, Cipher cipher, NodeStore store, String branch,
+              Mutex mutex,
+              UserModule userModule
+              ) :
+        __mutex = mutex,
+        __backing = backing,
+        __cipher = cipher,
+        __store = store,
+        __branch = branch,
+        __userModule = userModule,
+        __infoFiles = InfoFiles(__nonceMan) {
+
+        resetTree();
+    }
+
+    ## Get the instance's current cipher.  Does not require the lock, as the
+    ## cipher is efffectively immutable and is assigned at construction.
+    Cipher getCipher() {
+        return __cipher;
+    }
+
+    ## Get the instance's NonceManager.  Does not require the lock, as the
+    ## nonce manager has its own lock and is assigned at construction.
+    NonceManager getNonceManager() {
+        return __nonceMan;
+    }
+
+    ## Returns a lock on the instance state.  Clients must retain this lock
+    ## object for the duration of their session with InstanceState or any
+    ## objects managed by it.  Attempting to call a function without the lock
+    ## will throw an InvalidStateError.
+    MutexLock lock() {
+        return __Lock(__mutex, this);
+    }
+
+    @define checkLock() {
+        if (!__locked)
+            throw InvalidStateError('Inatance not locked.');
+    }
+
+    ## Sets the current mountpoint.
+    void setMountpoint(Path mountpoint) {
+        @checkLock();
+        __mountpoint = mountpoint;
+    }
+
+    ## Gets the current mountpoint.
+    Path getMountpoint() {
+        @checkLock();
+        return __mountpoint;
+    }
+
+    ## Returns the backing directory.
+    Path getBacking() {
+        @checkLock();
+        return __backing;
+    }
+
+    ## Returns the latest commit digest on the current branch.
+    String getHead() {
+        @checkLock();
+        return __store.getHead(__branch);
+    }
+
+    void setHead(String commitDigest) {
+        @checkLock();
+        __store.setHead(__branch, commitDigest);
+    }
+
+    ## Returns the current branch name.
+    String getBranch() {
+        @checkLock();
+        return __branch;
+    }
+
+    ## Set the branch to that specified.  This also changes the root node and
+    ## resets the tree.
+    void setBranch(String branch) {
+        @checkLock();
+        __branch = branch;
+        resetTree();
+    }
+
+    ## Calls the start() method of the UserModule, if there is one.  This then
+    ## releases the reference to the UserModule.
+    void start() {
+        @checkLock();
+        if (__userModule) {
+            __userModule.start();
+            __userModule = null;
+        }
+    }
+
+    ## Does a full commit on the tree (see Tree.commit()).
+    void commit() {
+        @checkLock();
+        __tree.commit();
+        resetTree();
+    }
+
+    ## Does a full commit on the tree (see Tree.commit()).
+    void commit(CommitMetadata metadata) {
+        @checkLock();
+        __tree.commit(null, metadata);
+        resetTree();
+    }
+
+    ## Gets the root directory of the filesystem.
+    MAWFSPath getRoot() {
+        @checkLock();
+        return __root;
+    }
+
+    void setRoot(MAWFSPath root) {
+        @checkLock();
+        __root = root;
+    }
+
+    ## Store a new FileInfo object for the given reader and writer.
+    FileInfo makeFileInfo(MAWFSPath path, SeekableReader reader,
+                          SeekableWriter writer
+                          ) {
+        @checkLock();
+
+        # Find the first unused handle
+        uint64 fh = 0;
+        while (__files.hasKey(fh))
+            ++fh;
+
+        # Create, store and return it.
+        fi := FileInfo(fh, path, reader, writer);
+        __files[fh] = fi;
+        return fi;
+    }
+
+    ## Gets the fileinfo object, returns null if not defined.
+    FileInfo getFileInfo(int fh) {
+        @checkLock();
+        return __files.get(fh);
+    }
+
+    ## Delete the fileinfo for the filehandle.
+    void deleteFileInfo(int fh) {
+        @checkLock();
+        __files.delete(fh);
+    }
+
+    ## Add a resident branch.  Throws an InvalidArgumentError if the branch
+    ## does not exist.  Succeeds silently if the branch is already resident.
+    MAWFSPath makeResidentBranch(String branchName) {
+        @checkLock();
+        result := __branches.getBranchDir(branchName);
+        if (!result)
+            throw InvalidArgumentError(FStr() `Invalid branch $branchName`);
+        return result;
+    }
+
+    ## Make a resident branch for the given root object.
+    void makeResidentBranch(String branchName, CachedNode root) {
+        @checkLock();
+        __branches.makeBranchDir(branchName, root);
+    }
+
+    ## Removes a resident branch.  Throws a KeyError if it doesn't exist.
+    void removeResidentBranch(String branchName) {
+        @checkLock();
+        __branches.removeBranchDir(branchName);
+    }
+
+    ## Returns the tree for the given resident branch.  Returns null if the
+    ## branch is not defined.
+    Tree getResidentBranchTree(String branchName) {
+        @checkLock();
+        return __branches.getBranchTree(branchName);
+    }
+
+    ## Returns the node store.
+    NodeStore getStore() {
+        @checkLock();
+        return __store;
+    }
+
+    ## Set the value of an "info file" to be stored in the .mawfs
+    ## administrative directory.
+    void setInfoFile(String filename, String contents) {
+        @checkLock();
+        __infoFiles[filename] = contents;
+    }
+
+    ## Set the pending merge operation.  'mergeState' may be null to clear the
+    ## current pending merge.
+    void setPendingMerge(MergeState mergeState) {
+        @checkLock();
+        __pendingMerge = mergeState;
+    }
+
+    ## Returns the current merge state, or null if we're not in a pending
+    ## merge.
+    MergeState getPendingMerge() {
+        @checkLock();
+        return __pendingMerge;
+    }
+
+    ## Creates the Merger for the current merge state.  Throws
+    ## InvalidStateError if there is no pending merge.
+    Merger makeMerger() {
+        @checkLock();
+        if (!__pendingMerge)
+            throw InvalidStateError('No merge operation is pending.');
+        orgRoot := __branches.getBranchTree('merge:org').getRoot();
+        otherRoot :=
+            __branches.getBranchTree(__pendingMerge.otherBranch).getRoot();
+        return Merger(__tree.getRoot(), orgRoot, otherRoot, __pendingMerge);
+    }
+
+    void save();
+
+    String getInstanceName() {
+        @checkLock();
+        if (!__name) {
+            # If we don't have a name, make one up.
+            __name = altEncode(getEntropySource().getString(8));
+
+            # Check for a backing store, makes it a bit easier to deal with
+            # this in a unit test.
+            if (__backing)
+                save();
+        }
+        return __name
+    }
+
+    void setInstanceName(String name) {
+        @checkLock();
+        __name = name;
+        save();
+    }
+
+    ## Load the local instance state from the backing store.
+    void load() {
+        @checkLock();
+
+        # Quit early if there's no state file.
+        instStateFile := __backing/'inst';
+        if (!instStateFile.exists())
+            return;
+
+        state := LocalInstanceState();
+        serialized := instStateFile.readAll();
+        readMessageFromString(state, __cipher.decrypt(serialized));
+        __pendingMerge = state.mergeState;
+        __name = state.instanceName;
+
+        # If we're currently looking at the target branch, set to the merge
+        # branch.
+        if (__pendingMerge && __pendingMerge.targetBranch == __branch) {
+
+            # Restore the resident branches.
+            orgTree := Tree(__store,
+                            __root.getCachedNode().getContext().getCache(),
+                            __branch
+                            );
+            orgTree.setTargetChange(__pendingMerge.orgChange);
+            orgTree.initialize();
+            makeResidentBranch('merge:org', orgTree.getRoot());
+            makeResidentBranch(__pendingMerge.otherBranch);
+            setBranch(__pendingMerge.mergeBranch);
+        }
+    }
+
+    ## Write the local instance state to the backing store.
+    void save() {
+        @checkLock();
+        state := LocalInstanceState();
+        state.mergeState = __pendingMerge;
+        state.instanceName = __name;
+        (__backing/'inst').writeAll(__cipher.encrypt(state.toString()));
+    }
+
+    ## Create a new state object, creating a new commit node and root node if
+    ## necessary.
+    @static InstanceState create(Path backing, Cipher cipher,
+                                 NodeStore store,
+                                 String branch,
+                                 Mutex mutex,
+                                 UserModule userModule
+                                 ) {
+        # Get the existing root node or create one if this is an empty
+        # filesystem.
+        commitDigest := store.getHead(branch);
+        if (!commitDigest) {
+            info `creating new filesystem`;
+            store.createRepository(branch);
+        }
+
+        state := InstanceState(backing, cipher, store, branch, mutex,
+                               userModule
+                               );
+        lock := state.lock();
+        state.load();
+        return state;
+    }
+}

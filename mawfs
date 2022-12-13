@@ -1,0 +1,1232 @@
+#!/usr/local/bin/crack
+# Copyright 2016 Google Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import crack.ascii hex, radix, toLower;
+import crack.cmdline CmdOptions, Option, CMD_BOOL, CMD_INT, CMD_STR;
+import crack.enc.base64 altDecode, altEncode;
+#import crack.exp.fuse fuseMain = main, LockedFilesystem, NodeImpl;
+import crack.lang Exception, InvalidArgumentError, SystemError;
+
+import crack.fs cwd, makePath, Path;
+import crack.process Process, CRK_PIPE_STDERR, CRK_PIPE_STDOUT;
+import crack.runtime abort, backtrace, close, free, getLocation, isatty,
+    memcmp, open, sigaction, strlen, SigAction, SigInfo, O_RDONLY,
+    SA_SIGINFO, SIGFPE, SIGILL, SIGSEGV;
+import crack.strutil split, StringArray;
+import crack.sys argv, exit;
+import crack.time Date;
+import crack.io cin, cout, cerr, Formatter, FStr, Reader, StandardFormatter,
+    StringFormatter, StringReader;
+
+import crack.hash.sha256 SHA256;
+
+import crack.cont.array Array;
+import crack.io.readers LineReader;
+import crack.lang AppendBuffer, InvalidStateError;
+import crack.logger cerrLogger;
+import crack.logger debug, error, setLogFile, setLogLevel, DEBUG, INFO,
+    WARN, ERROR, FATAL;
+import crack.logger.ctx Log;
+import crack.net.comm2 Comm;
+import crack.net.ssl SSLContext;
+import crack.protobuf readMessageFromString;
+import crack.threads Mutex;
+
+import mawfs.aes_siv SIVCipher;
+import mawfs.blockstore hashFile, ChunkStore, Commit, CommitMetadata, FSInfo,
+    Node, BLOCK_SIZE;
+import mawfs.cache sig;
+import mawfs.ciphers Cipher;
+import mawfs.configstore ConfigStore;
+import mawfs.entropy DeviceEntropySource;
+import mawfs.fuse runFuse;
+import mawfs.flows MAWFSInstance;
+import mawfs.inst InstanceState, LocalInstanceState, UserModule;
+import mawfs.params ParamInfo;
+import mawfs.peernet PeerNetwork, RemoteReaderImpl;
+import mawfs.rawchunk RawChunkReader;
+import mawfs.rpc parseAddr, ExtendedAddress, PeerProxy, TRAVERSE_DELTA,
+    TRAVERSE_FULL, TRAVERSE_NONE;
+import mawfs.ssl makeAnonSSLContext, makeClientSSLContext, makeSSLContext;
+import mawfs.util traverseCommit;
+
+@import crack.ann assert, impl, struct;
+@import mawfs.gitver gitver;
+
+import 'libc.so.6' fsync;
+int fsync(int fd);
+
+#class DirNode : NodeImpl {
+#    @static DirNode readFrom(Reader src) {
+
+#void mount(String backing, String mountPoint) {
+#
+#    backingRoot := makePath(backing);
+#    fuseMain(StringArray!['<mawfs>', mountPoint], LockedFilesystem(backingRoot));
+#    # xxxx finish writing xxxxx
+#}
+
+# Lifted from crack.lang.
+
+const VERSION := @gitver;
+const _ADDRS_SIZE := 100;
+const array[voidptr] _addrs = {_ADDRS_SIZE};
+const array[byteptr] _addrInfo = {3};
+
+class Abort : Exception {
+    oper init(String message) : Exception(message) {}
+}
+
+void trapHandler(int signal, SigInfo si, voidptr ucontext) {
+    StringFormatter trace = {};
+    trace `Stack Trace\n`;
+    numFrames := backtrace(_addrs, _ADDRS_SIZE);
+    if (numFrames == _ADDRS_SIZE)
+        trace `    [stack trace truncated]\n`;
+    for (int i = numFrames - 1; i; --i) {
+        getLocation(_addrs[i], _addrInfo);
+        if (strlen(_addrInfo[0]) >= 8 &&
+            !memcmp(_addrInfo[0], ':unknown'.buffer, 8)) {
+            trace `    unknown address\n`;
+        } else {
+            trace `    $(_addrInfo[0])\n`;
+        }
+    }
+
+    if (signal == SIGSEGV)
+        trace `    SIGSEGV received\n`;
+    else if (signal == SIGILL)
+        trace `    SIGILL received\n`;
+    else if (signal == SIGFPE)
+        trace `    SIGFPE received\n`;
+    else
+        trace `    Unexpected signal received\n`;
+
+    error `$(trace.string())\n`;
+
+    abort();
+}
+
+void dumpNode(Formatter out, Node node) {
+    if (node.checksum)
+        out `checksum: $(node.checksum)\n`;
+    if (!(node.contents is null))
+        out `contents: $(node.contents.getRepr())\n`;
+    out `mode: $(node.mode)\n`;
+    out `size: $(node.size)\n`;
+    if (node.children) {
+        out `children:\n`;
+        for (child :in node.children) {
+            out `-  hash: $(sig(child.hash))\n`;
+            if (child.name)
+                out `   name: $(child.name)\n`;
+            if (child.org_checksum)
+                out `   org_checksum: $(child.org_checksum)\n`;
+        }
+    }
+}
+
+## Returns a reader for the file specified by 'filename'.  If 'filename' is
+## "-", returns a reader for standard input.
+Reader getReader(String filename) {
+    if (filename == '-') {
+        return cin;
+    } else {
+        return makePath(filename).reader();
+    }
+}
+
+class RPCCmd {
+    PeerProxy __proxy;
+    Log __log;
+    Comm __comm;
+
+    oper init(ExtendedAddress addr, String authNonce) {
+        __log = Log(cerrLogger, 'client');
+        __comm = Comm(__log);
+        __comm.start();
+        SSLContext sslCtx;
+        if (addr.ssl) {
+            if (authNonce)
+                sslCtx = makeClientSSLContext(__comm, authNonce);
+            else
+                sslCtx = makeAnonSSLContext(__comm);
+        }
+        __proxy = PeerProxy.make(__comm, __log, addr, sslCtx);
+
+        # If we connected but didn't authenticate over SSL, do a login.
+        if (__proxy && (!addr.ssl || !authNonce)) {
+            nonce := authNonce;
+            if (!nonce) {
+                mountpoint := __proxy.getMountpoint();
+                noncePath := makePath(mountpoint)/'.mawfs/inst/nonce';
+                if (noncePath.exists())
+                    nonce = noncePath.readAll();
+            }
+
+            __proxy.login(nonce);
+        }
+    }
+
+    oper del() {
+        __comm.stop();
+    }
+
+    PeerProxy getProxy() { return __proxy }
+
+    void pullBranch(String branch, String peer) {
+        localName := __proxy.pullBranch(branch, peer);
+        cerr `Branch loaded into $localName\n`;
+    }
+}
+
+String readPassword() {
+    String password;
+    if (isatty(0)) {
+        lr := LineReader(cin);
+
+        p := Process(StringArray!['/bin/stty', '-g'],
+                     CRK_PIPE_STDOUT | CRK_PIPE_STDERR);
+        orig_term_settings := p.getStdOut().rtrim();
+        cmd_err := p.getStdErr().rtrim();
+        if (cmd_err != "") {
+            throw InvalidStateError('Got an error from stty; terminal may '
+                                    'be in a bad state');
+        }
+
+        p = Process(StringArray!['/bin/stty', '-echo'],
+                     CRK_PIPE_STDOUT | CRK_PIPE_STDERR);
+        cmd_err = p.getStdErr().rtrim();
+        if (cmd_err != "") {
+            throw InvalidStateError('Got an error from stty; terminal may '
+                                    'be in a bad state');
+        }
+
+        cout `password: `;
+        password = lr.readLine().rtrim();
+        cout `\n`;
+
+        p = Process(StringArray!['/bin/stty', orig_term_settings],
+                     CRK_PIPE_STDOUT | CRK_PIPE_STDERR);
+        cmd_err = p.getStdErr().rtrim();
+        if (cmd_err != "") {
+            throw InvalidStateError('Got an error from stty; terminal may '
+                                    'be in a bad state');
+        }
+    } else {
+        lr := LineReader(cin);
+        password = lr.readLine().rtrim();
+    }
+
+    hasher := SHA256();
+    hasher.update(password);
+    hashed_password := hasher.digest();
+
+    return hashed_password;
+}
+
+## initializes the chunk store from disk.  Reads the password from the user.
+## Creates the backing store if it doesn't exist and maybeCreate is true,
+## otherwise throws and Abort.
+ChunkStore makeChunkStore(Path backingDir, bool maybeCreate) {
+    password := readPassword();
+    entropy := DeviceEntropySource(makePath('/dev/urandom'));
+    paramsFile := backingDir/'params';
+    ParamInfo params;
+
+    if (backingDir.exists() && paramsFile.exists()) {
+        params = ParamInfo.read(backingDir/'params', password);
+        if (!params)
+            throw Abort('Invalid password');
+    } else if (maybeCreate) {
+        # Write a new params file.
+        if (!backingDir.exists())
+            backingDir.makeDir();
+        params = ParamInfo.getDefault(password);
+        params.writeTo((backingDir/'params').writer(), entropy);
+    } else {
+        throw Abort(FStr() `Backing dir $backingDir does not exist.`);
+    }
+
+    return ChunkStore(backingDir, FSInfo(params.cipher));
+}
+
+## Parse a peer adress or exit with an error message.
+ExtendedAddress parsePeerAddr(String arg) {
+    try {
+        return parseAddr(arg);
+    } catch (Exception ex) {
+        cerr I`Invalid address specification for peer address: \
+               $arg\n`;
+        exit(1);
+        return null;
+    }
+}
+
+opts := CmdOptions![
+    Option('logfile', 'l', 'logfile name', 'mawfs.log', CMD_STR),
+    Option('branch', 'b', 'branch name', 'master', CMD_STR),
+    Option('port', 'p', 'port number', '9119', CMD_INT),
+    Option('no-server', 's',
+           'if set to false, disable configuring a server for a new instance',
+           'false',
+           CMD_BOOL
+           ),
+    Option('ssl', '',
+           I'enable ssl for a new instance (true, false or empty to use the
+           default value',
+           '',
+           CMD_STR
+           ),
+    Option('iface', 'f',
+           'Server interface to bind to.  This is only used by commands that '
+           'create an instance ("create" and "clone") and only when the '
+           '--port option is also specified.',
+           '0.0.0.0',
+           CMD_STR
+           ),
+    Option('instance', 'i', 'instance directory or address', null, CMD_STR),
+    Option('overwrite', 'o', 'overwrite existing backing directoory', null,
+           CMD_BOOL
+           ),
+    Option('traverse-type', 't',
+           I'Traversal algorithm for "traverse" or "pull" command. Valid
+             values are "full" or "delta" (or "none" in the case of a pull).
+             For the "traverse" command, the default is "full".  For all
+             other commands the default is "delta"',
+
+           null,
+           CMD_STR
+           ),
+    Option('verbosity', 'v',
+           'Log verbosity.  Values are "debug", "info", "warn", "error" '
+           'and "fatal".  "info" is the default.',
+           'info',
+           CMD_STR
+           ),
+    Option('name', 'n',
+           'When creating a new instance, this is the name of the new '
+           'instance.  If absent, a random name is used.',
+           '',
+           CMD_STR
+           ),
+    Option('peer-name', 'r',
+           'During a clone operation, identifies the peer name to create '
+           'for the remote instance ("origin" is used by default)',
+           'origin',
+           CMD_STR
+           ),
+    Option('comment', 'm',
+           'When specified during commit, add a commit message.'
+           null,
+           CMD_STR
+           ),
+    Option('committer', 'a',
+           'When specified during commit, e-mail address of the committer.',
+           null,
+           CMD_STR
+           ),
+
+    Option('version', 'v', 'Write version and exit.', null, CMD_BOOL),
+    Option('help', 'h',
+           'Show this help message (equivalent to the "help" command)',
+           null,
+           CMD_BOOL
+           ),
+];
+
+## Convenience class for obtaining the peer network parameters from the
+## instance.
+class PeerNetParams {
+    Cipher cipher;
+    String name;
+
+    oper init(InstanceState state, bool locked) {
+        lock := locked ? typeof(state.lock()).cast(null, null) : state.lock();
+        if (!locked)
+            @assert(lock);
+        cipher = state.getCipher();
+        name = state.getInstanceName();
+    }
+}
+
+class CommandManager {
+
+    # Root of the backing store.
+    Path rootDir;
+    StringArray args;
+
+    # Backing store.  This current only gets set by the dump functions.
+    ChunkStore store;
+
+    oper init(StringArray args) : args = args {}
+
+    void checkArgs(int count, String message) {
+        if (args.count() != count) {
+            cerr `$message\n`;
+            exit(1);
+        }
+    }
+
+    void checkArgsAtLeast(int minCount, String message) {
+        if (args.count() < minCount) {
+            cerr `$message\n`;
+            exit(1);
+        }
+    }
+
+    int parseLogVerbosity() {
+        verbosity := toLower(opts.getString('verbosity'));
+        if (verbosity == 'debug')
+            return DEBUG;
+        else if (verbosity == 'info')
+            return INFO;
+        else if (verbosity == 'warn')
+            return WARN;
+        else if (verbosity == 'error')
+            return ERROR;
+        else if (verbosity == 'fatal')
+            return FATAL;
+        else
+            throw Abort(FStr() I`Unknown value "$verbosity" for verbosity \
+                                 option.  Legal values are debug, info, warn \
+                                 error and fatal.`
+                        );
+    }
+
+    void initLogs() {
+        setLogFile(opts.getString('logfile'));
+        setLogLevel(lvl := parseLogVerbosity());
+    }
+
+    ## Create the network config file (if 'port' is defined).
+    void createConfig(Path rootDir, bool defaultSSL) {
+        # Create a peer config if "port" is specified.
+        if (!opts.getBool('no-server') && (port := opts.getString('port'))) {
+            String iface = opts.getString('iface');
+            bool ssl;
+            if (opts.getString('ssl') == 'true')
+                ssl = true;
+            else if (opts.getString('ssl') == 'false')
+                ssl = false;
+            else
+                ssl = defaultSSL;
+
+            (rootDir/'config').makeDirs();
+            StandardFormatter((rootDir/'config'/'peers').writer()) I`\
+                [server]
+                iface = $iface
+                port = $port
+                ssl = $ssl
+                `;
+        }
+    }
+
+    ## Initialize the backing store and its config, giving an error if it
+    ## doesn't exist.
+    void initBackingStore(String arg, bool defaultSSL) {
+        rootDir = makePath(arg);
+        if (rootDir.exists() && !opts.getBool('overwrite')) {
+            cerr `Directory $rootDir already exists\n`;
+            exit(1);
+        }
+
+        createConfig(rootDir, defaultSSL);
+    }
+
+    ## Create the chunk store, also initializing the params file in the
+    ## backing store if it doesn't exist.
+    ChunkStore makeChunkStore() {
+        return makeChunkStore(rootDir, true);
+    }
+
+    ## Write instructions for running the command.
+    void showRunInstructions() {
+        cerr `"mawfs run $rootDir <mount-point>" to begin using it.\n`;
+    }
+
+    @struct ServerAndNonce {
+        String server;
+
+        ## May be null if the server was not obtained from a directory.
+        String nonce;
+    }
+
+    @static ServerAndNonce __getServerFromDir(Path path) {
+        serversFile := path/'.mawfs/inst/servers';
+        if (!serversFile.exists())
+            return null;
+        contents := serversFile.readAll();
+        if (contents) {
+            addr := split(contents, b'\n')[0];
+
+            # Translate 0.0.0.0 (INADDR_ANY) into localhost.
+            if (addr.startsWith('0.0.0.0'))
+                addr = '127.0.0.1' + addr.substr(7);
+
+            noncePath := path/'.mawfs/inst/nonce';
+            nonce := (noncePath).exists() ? noncePath.readAll() : null;
+
+            return ServerAndNonce(addr, nonce);
+        } else {
+            cerr `MAWFS instance $path defines no servers.\n`;
+        }
+        return null;
+    }
+
+    ## Get a server address from the specified name.  'name' can either be a
+    ## directory or an explicit hostname:port address.
+    ServerAndNonce getServer(String name) {
+        # Got one.  Is it a directory?
+        if ((path := makePath(name)).isDir()) {
+            return __getServerFromDir(path);
+        }
+
+        # If it wasn't a directory or didn't contain a server address, try
+        # treating it as an address.
+        return ServerAndNonce(name, null);
+    }
+
+    ## Get the instance server address and (possibly) the auth nonce. The
+    ## rules are:
+    ##    if there is a -i (or --instance) argument:
+    ##        if it is a directory, and contains a non-empty
+    ##              .mawfs/inst/servers file:
+    ##           return the first address in the file
+    ##        return the value of the argument itself (it should be an address)
+    ##    else if there is a .mawfs/inst/servers file in the current directory:
+    ##        return the first address in the file.
+    ##    else:
+    ##        return null
+    ServerAndNonce getServer() {
+        ServerAndNonce result;
+
+        # Now we need to find the address of the instances we're connecting to.
+        # First check for an instance flag.
+        inst := opts.getString('instance');
+        if (inst) {
+            result = getServer(inst);
+        } else {
+            result = __getServerFromDir(cwd);
+        }
+
+        if (!result) {
+            cerr I`You must either call this from a MAWFS filesystem directory
+                   or specify an instance directory or address using the -i flag.
+                   `;
+            exit(1);
+        }
+        return result;
+    }
+
+    RPCCmd getRPC() {
+        serverAndNonce := getServer();
+        addr := parseAddr(serverAndNonce.server);
+        if (!addr)
+            throw Abort(FStr() I`Unable to resolve server address \
+                                 $(serverAndNonce.server)`
+                        );
+        cmd := RPCCmd(addr, serverAndNonce.nonce);
+        if (!cmd.getProxy())
+            throw Abort(FStr() `Unable to connect to $addr`);
+        return cmd;
+    }
+
+    ## Returns the traversal type extracted from the "traverse" argument and
+    ## converted to an integer.
+    ##
+    ## isTraverseCommand: True if this is being called from the traverse
+    ##    command, in which case "none" is not a valid option.
+    int getTraverseType(bool isTraverseCommand, int default) {
+        algoStr := opts.getString('traverse-type');
+        if (algoStr == 'full') {
+            return TRAVERSE_FULL;
+        } else if (algoStr == 'delta') {
+            return TRAVERSE_DELTA;
+        } else if (algoStr == 'none') {
+            if (isTraverseCommand)
+                throw Abort('A traverse algorithm of "none" is not valid for '
+                            'the traverse command.'
+                            );
+            return TRAVERSE_NONE;
+        } else if (algoStr != null) {
+            throw Abort(
+                FStr() I`Unknown traversal type $algoStr.  Types are \
+                         "full" and "delta".`
+            );
+        }
+        return default;
+    }
+
+
+    ## Set the name of a newly created instance if one has been provided by
+    ## the user.
+    void _setInstanceName(Cipher cipher) {
+        @assert(rootDir);
+        # Set the instance name if one is provided.
+        if (name := opts.getString('name')) {
+            # We don't necessarily have an instance state, so we just create
+            # the instance state proto file directly.
+            state := LocalInstanceState();
+            state.instanceName = name;
+            (rootDir/'inst').writeAll(cipher.encrypt(state.toString()));
+        }
+    }
+
+    ## The "commit" command.
+    void commit() {
+        if (args.count() == 3) {
+            # Old style commit, just do a sync.
+
+            if (opts.getString('comment')) {
+                cerr `Old style commit can not accespt a commit message.\n`;
+                exit(1);
+            }
+
+            fd := open(args[2].buffer, O_RDONLY, 0);
+            if (fd == -1) {
+                cerr `Unable to open $(args[2]): c_strerror()\n`;
+                exit(1);
+            } else {
+                fsync(fd);
+                close(fd);
+                cerr `Synced.\n`;
+            }
+        } else if (args.count() == 2) {
+            message := opts.getString('comment');
+            committer := opts.getString('committer');
+            CommitMetadata md;
+            if (message || committer) {
+                md = CommitMetadata();
+                md.comment = message;
+                md.committer = committer;
+            }
+            getRPC().getProxy().commit(md);
+        } else {
+            cerr `Usage: commit <mount-point>\n      commit -m <message\n`;
+            exit(1);
+        }
+    }
+
+    ## The "clone" command.
+    void clone() {
+        checkArgs(4, 'Usage: mawfs clone <peer-address> <backing-dir>\n');
+
+        # Need to share all of this code with 'pull'.
+        peerAddr := parsePeerAddr(getServer(args[2]).server);
+        password := readPassword();
+        tempCipher := SIVCipher(password, null);
+
+        # Initialize backing store, use the peer's ssl setting as a default.
+        initBackingStore(args[3], peerAddr.ssl);
+
+        mutex := Mutex();
+        store := ChunkStore(rootDir, FSInfo(tempCipher));
+        instState := InstanceState.create(rootDir, tempCipher, store,
+                                          opts.getString('branch'),
+                                          mutex,
+                                          null
+                                          );
+        if (name := opts.getString('name')) {
+            lock := instState.lock();
+            instState.setInstanceName(name);
+        }
+
+        params := PeerNetParams(instState, false);
+
+        # Only need a raw chunk reader if we're running a server, so we
+        # can give it a null.
+        net := PeerNetwork(null, params.cipher, params.name,
+                           MAWFSInstance(instState)
+                           );
+        net.setSSLContext(makeClientSSLContext(net.getComm(), tempCipher));
+        net.addPeer('origin', peerAddr);
+
+        # If there's no params file, get one.
+        paramInfo := net.pullParams(rootDir, password);
+        if (!paramInfo) {
+            cerr `No peers found (or bad password).\n`;
+            makePath(args[3]).deleteTree();
+            exit(1);
+        }
+
+        store.setRemoteReader(RemoteReaderImpl(net));
+
+        master := net.getHead('master').head;
+        cerr `master is $(altEncode(master))\n`;
+        net.pullJournal(rootDir, 'master', false);
+
+        cerr `getting head\n`;
+        traverseCommit(store, master, store.getTraversed());
+
+        cerr `writing master...\n`;
+        refsDir := rootDir/'refs';
+        refsDir.makeDirs();
+        (refsDir/'master').writeAll(altEncode(master));
+
+        # Update the peers file with the new peer.
+        peers := (rootDir/'config/peers').readAll();
+        peersOut :=
+            StandardFormatter((rootDir/'config/peers').writer());
+        peersOut.write(peers);
+        peersOut I`
+            [peer-$(opts.getString('peer-name'))]
+            host = $(peerAddr.getHostname())
+            port = $(peerAddr.getPort())
+            ssl = $(peerAddr.ssl ? 'true' : 'false')
+            `;
+        showRunInstructions();
+    }
+
+    ## Dump a bunch of information from the backing directory (currently only
+    ## "inst".
+    void dumpBacking() {
+        checkArgs(3, 'Usage: mawfs show <backing-dir>\n');
+        rootDir = makePath(args[2]);
+        password := readPassword();
+        tempCipher := SIVCipher(password, null);
+        state := LocalInstanceState();
+        data := tempCipher.decrypt((rootDir/'inst').readAll());
+        readMessageFromString(state, data);
+        cout `$state\n`;
+    }
+
+    ## The "run" command.
+    void run() {
+        checkArgsAtLeast(
+            4,
+            I"Usage: mawfs run [-b branch] <backing-dir> [fuse-options] \
+              <mount-point>\n"
+        );
+
+        sa := SigAction();
+        sa.sa_sigaction = trapHandler;
+        sa.sa_flags = SA_SIGINFO;
+        sigaction(SIGSEGV, sa, null);
+        sigaction(SIGILL, sa, null);
+        sigaction(SIGFPE, sa, null);
+        free(sa);
+        sa = null;
+
+        # Last argument should be a mountpoint, verify that it exists.
+        if (!makePath(args[-1]).isDir())
+            throw Abort(FStr() I`Mountpoint $(args[-1]) does not exist \
+                                 or is not a directory.`
+                        );
+
+        StringArray fuseArgs = [args[0]];
+        fuseArgs.extend(args.subarray(3));
+
+        setLogFile(opts.getString('logfile'));
+
+        rootDir = makePath(args[2]);
+        newInstance := !(rootDir/'params').exists();
+        chunkStore := makeChunkStore(rootDir, true);
+
+        if (newInstance) {
+            _setInstanceName(chunkStore.getCipher());
+            createConfig(rootDir, true);
+        }
+
+        # Initialize the config store (we have to do this after it may
+        # have been created).
+        configStore := ConfigStore(rootDir, 'peers');
+
+        # Start the peer network.
+        mutex := Mutex();
+        chunkReader := chunkStore.getRawChunkReader(mutex);
+
+        class PeerNetModule @impl UserModule {
+            PeerNetwork __net;
+            ConfigStore __config;
+            RawChunkReader __chunkReader;
+            InstanceState instState;
+
+            oper init(ConfigStore config, RawChunkReader chunkReader) :
+                __config = config,
+                __chunkReader = chunkReader {
+            }
+
+            void start() {
+                params := PeerNetParams(instState, true);
+                mawfsInstance := MAWFSInstance(instState);
+                __net = PeerNetwork(__chunkReader, params.cipher,
+                                    params.name,
+                                    mawfsInstance
+                                    );
+                __net.setSSLContext(makeSSLContext(mawfsInstance,
+                                                   __net.getComm(),
+                                                   instState.getCipher()
+                                                   )
+                                    );
+                __net.configure(__config);
+                __net.storeServersIn(instState);
+
+                # Set the remote reader from the peer net (note that we
+                # already have the instance lock).
+                instState.getStore().setRemoteReader(
+                    RemoteReaderImpl(__net)
+                );
+            }
+        }
+
+        peerModule := PeerNetModule(configStore, chunkReader);
+        instState := InstanceState.create(rootDir,
+                                          chunkStore.getCipher(),
+                                          chunkStore,
+                                          opts.getString('branch'),
+                                          mutex,
+                                          peerModule
+                                          );
+
+        # Create a temporary reference cycle, this will be resolved in
+        # InstanceState.start() when the instance state releases the
+        # PeerNetModule.
+        peerModule.instState = instState;
+        runFuse(instState, fuseArgs);
+    }
+
+    ## The "dump" command.
+    void dump() {
+        checkArgs(3, "Usage: mawfs dump <path>");
+
+        password := readPassword();
+
+        path := makePath(args[2]);
+        contents := path.readAll();
+
+        # See if this is a tag.
+        if (contents.count() == 64 &&
+            ((refed := path.parent()/altDecode(contents))).exists()
+            )
+            contents = refed.readAll();
+
+        # Read it.
+        chunk := FSInfo(password).readChunk(StringReader(contents));
+        Node node = {};
+        readMessageFromString(node, chunk.contents);
+        dumpNode(cout, node);
+    }
+
+    ## The "create" command.
+    void create() {
+        checkArgs(3, 'Usage: mawfs create <backing-dir>\n');
+        cerr `port is $(opts.getInt('port'))\n`;
+        initBackingStore(args[2], true);
+        cipher := makeChunkStore().getCipher();
+        _setInstanceName(cipher);
+        cerr I`MAWFS Cell created\n`;
+        showRunInstructions();
+    }
+
+    ## The "pull" command.
+    void pull() {
+        checkArgsAtLeast(3, "Usage: mawfs pull <branch> [peer]\n");
+        branch := args[2];
+
+        rpc := getRPC();
+        rpc.pullBranch(branch, (args.count() > 3) ? args[3] : null);
+        traverseType := getTraverseType(false, TRAVERSE_DELTA);
+        if (traverseType != TRAVERSE_NONE)
+            rpc.getProxy().traverse(branch, traverseType);
+    }
+
+    ## The "push" command.
+    void push() {
+        checkArgsAtLeast(2, 'Usage: mawfs push <branch> <peer>\n');
+        branch := args[2];
+        peer := args[3];
+        traverseType := getTraverseType(false, TRAVERSE_DELTA);
+
+        rpc := getRPC();
+        remoteBranch := rpc.getProxy().pushBranch(branch, peer, traverseType);
+        cout `remote branch: $remoteBranch\n`;
+    }
+
+    ## The "merge" command.
+    void merge() {
+        checkArgs(3, "Usage: mawfs merge <branch>\n");
+
+        result := getRPC().getProxy().merge(args[2]);
+        if (result.commit)
+            cout `committed: $(sig(result.commit))\n`;
+        else {
+            cout `created merge branch: $(result.mergeBranch)\n`;
+            cout `Conflicts (must be merged manually):\n`;
+            for (name :in result.conflict)
+                cout `   $name\n`;
+        }
+    }
+
+    ## The "resolve" command.
+    void resolve() {
+        checkArgs(2, "Usage: mawfs resolve\n");
+        getRPC().getProxy().resolve();
+        cout `Resolve completed successfully\n`;
+    }
+
+    ## The "cancelMerge" command.
+    void cancelMerge() {
+        checkArgs(2, 'Usage: mawfs cancelMerge\n');
+        getRPC().getProxy().cancelMerge();
+        cout `Merge cancelled\n`;
+    }
+
+    ## THe "addPeer" command.
+    void addPeer() {
+        checkArgs(4, 'Usage: mawfs addPeer <peer-name> <peer-addr>');
+        getRPC().getProxy().addPeer(args[2], args[3]);
+    }
+
+    ## Formats a commit, returns the first parent digest if there is one.
+    String _formatCommit(Formatter out, Commit commit, String commitDigest) {
+        cout `commit: $(sig(commitDigest))\n`;
+        if (commit.metadata) {
+            if (commit.metadata.comment)
+                cout `  comment: $(commit.metadata.comment)\n`;
+            if (commit.metadata.committer)
+                cout `  commiter: $(commit.metadata.committer)\n`;
+        }
+        if (commit.timestamp)
+            cout `  timestamp: $(Date(commit.timestamp))\n`;
+        if (commit.parent) {
+            for (parent :in commit.parent)
+                cout `  parent: $(sig(parent))\n`;
+            return commit.parent[0]
+        } else {
+            return null;
+        }
+
+    }
+
+    void dbg_log() {
+        checkArgs(4, 'Usage: mawfs dbg_log <backing-dir> <branch>');
+        password := readPassword();
+        paramsFile := makePath(args[2])/'params';
+        if (!paramsFile.exists())
+            throw Abort('No params file');
+        params := ParamInfo.read(paramsFile, password);
+        if (!params)
+            throw Abort('Invalid password');
+        store := ChunkStore(makePath(args[2]), FSInfo(params.cipher));
+        branch := args[3];
+        commitDigest := store.getHead(branch);
+        if (!commitDigest) {
+            cerr `branch $branch not found\n`;
+            commitDigest = altDecode(branch);
+        }
+
+        cerr `looking up $(sig(commitDigest))\n`;
+        commit := store.getCommit(commitDigest);
+        if (!commit)
+            cerr `Head commit $(sig(commitDigest)) not found!\n`;
+        while (commit) {
+            commitDigest = _formatCommit(cout, commit, commitDigest);
+            commit = commitDigest ? store.getCommit(commitDigest) : null;
+        }
+    }
+
+    ## Does all of the common stuff for dumping different kinds of chunks.
+    ## Returns the digest to be dumped.
+    String _prepareToDump(String message) {
+        checkArgs(4, message);
+        rootDir = makePath(args[2]);
+        store = makeChunkStore(rootDir, false);
+        return altDecode(args[3]);
+    }
+
+    void dump_commit() {
+        commit := _prepareToDump(
+            'Usage: mawfs dump_commit <backing-dir> <commit-hash>'
+        );
+        commitObj := store.getCommit(commit);
+        cout I`parent: `;
+        if (commitObj.parent) {
+            for (p :in commitObj.parent)
+                cout `$(sig(p)) `;
+        } else {
+            cout `null`;
+        }
+        cout I`
+               root: $(sig(commitObj.root))
+               journalInfo: $(sig(commitObj.journalInfo))
+               journal: $(sig(commitObj.journal))
+               `;
+    }
+
+    void dump_node() {
+        digest := _prepareToDump(
+            'Usage: mawfs dump_node <backing-dir> <commit-hash>'
+        );
+        node := store.getNode(digest);
+        if (node)
+            dumpNode(cout, node);
+        else
+            cerr `node $(sig(digest)) not found\n`;
+    }
+
+    void load_branch() {
+        checkArgs(4, 'Usage: load_branch <backing-dir> <<branch>');
+        rootDir = makePath(args[2]);
+        store = makeChunkStore(rootDir, false);
+        branch := args[3];
+
+        import mawfs.cache Cache, CachedNode, NodeContext;
+
+        ctx := NodeContext(store, Cache(), branch);
+        headDigest := ctx.getHead();
+        commit := ctx.getCommit(headDigest);
+        ctx.recordCommit(headDigest);
+        rootNode := ctx.getNode(commit.root);
+        root := CachedNode(ctx, commit.root, rootNode);
+
+        cerr `journal entries:\n`;
+        for (entry :in ctx.getJournalInfo(commit.journalInfo))
+            cerr `$(sig(entry.key)) ($(entry.key.getRepr())\n`;
+
+        cerr `node time = $(root.getTime())\n`;
+        String lastChangeDigest;
+        for (entry :in ctx.makeJournalIter()) {
+            cerr `commit is $(sig(entry.change.commit))\n`;
+            if (entry.change.time >= root.getTime()) {
+                cerr `ignoring change from session $(
+                      sig(entry.change.sessionId))\n`;
+                continue;
+            } else {
+                cerr `replaying node $(entry.change)\n`;
+                cerr `commit is $(sig(entry.change.commit))\n`;
+            }
+            lastChangeDigest = root.replayChange(entry, lastChangeDigest);
+            cerr `replaying $(entry.change)\n`;
+        }
+    }
+
+
+    ## The "info" command.
+    void info() {
+        checkArgs(2, 'Usage: mawfs info\n');
+        result := getRPC().getProxy().getInfo();
+        cout I`Name: $(result.name)
+               Mountpoint: $(result.mountpoint)
+               `;
+    }
+
+    ## The "verify" command.
+    void verify() {
+        checkArgs(3, 'Usage: mawfs verify <backing-dir>\n');
+
+        backingDir := makePath(argv[2]);
+        objectsDir := backingDir/'objects';
+        failed := false;
+        if (!objectsDir.exists()) {
+            cerr `No "objects" dir found\n`;
+            failed = true;
+        } else {
+
+            # Verify the checksums on all chunks.
+            for (file :in objectsDir.children()) {
+                if (sig(hashFile(file)) != file.getName()) {
+                    cerr `$file has an invalid signature\n`;
+                    failed = true;
+                }
+            }
+
+            # Verify that all refs point to existing chunks.
+            for (file :in (backingDir/'refs').children()) {
+                if (!(objectsDir/file.readAll()).exists()) {
+                    cerr `Missing chunk for ref $(file.getName())\n`;
+                    failed = true;
+                }
+            }
+        }
+
+        if (failed) {
+            cerr `Some validations failed.\n`;
+            exit(1);
+        } else {
+            cerr `Directory $backingDir looks good.\n`;
+        }
+    }
+
+    ## The "traverse" command.
+    void traverse() {
+        checkArgs(3, 'Usage: mawfs traverse <branch>');
+        algo := getTraverseType(true, TRAVERSE_FULL);
+        getRPC().getProxy().traverse(args[2], algo);
+    }
+
+    void log() {
+        checkArgs(3, 'Usage: mawfs log <commit-digest-or-branch>');
+        commitDigest := args[2];
+        rpc := getRPC();
+        proxy := rpc.getProxy();
+        commitAndDigest := proxy.getCommit(commitDigest);
+        while (commitAndDigest) {
+            commitDigest = _formatCommit(cout, commitAndDigest.commit,
+                                         commitAndDigest.digest
+                                         );
+            commitAndDigest =
+                commitDigest ? proxy.getCommit(altEncode(commitDigest)) : null;
+        }
+    }
+
+    void usage() {
+        opts.writeUsage(cout, FStr() I`\
+            mawfs - An encrypted, distributed, branching filesystem.
+
+            Usage:
+                mawfs run <backing> <mountpoint>
+                    Mount a mawfs filesystem.
+                mawfs create <backing> [options]
+                    Create a new MAWFS instance.
+                mawfs clone <peer-address> <backing-store>
+                    Clone the remote peer into the give backing directory.
+                    The remote peer is in the form address:port.  The backing
+                    directory must not already exist.
+                mawfs pull <branch> [peer]
+                    Pull the branch. You may optionally specify a peer to pull
+                    the branch from a specific peer, otherwise the instance will
+                    just select one.
+                mawfs push <branch> <peer>
+                    Push the branch to the specified peer.  Prints the remote
+                    branch name.
+                mawfs merge <branch>
+                    Merge with another branch.  This produces a new commit if
+                    there are no conflicts, or a merge branch and a conflict
+                    report if there are.
+                mawfs resolve
+                    Resolve an outstanding merge that had conflicts.
+                mawfs cancelMerge
+                    Cancel an outstanding merge.
+                mawfs dump <filename>
+                    Dump the contents of an encrypted backing file.
+                mawfs addPeer <peer-name> <peer-addr>
+                    Add a new peer to the instance.  'peer-name' can be any name
+                    that is meaningful to the user.  'peer-addr' is an IP address
+                    in host:port format.
+                mawfs dbg_log <backing-dir> <branch>
+                    Show a log of all changes in a branch.  Requires a password.
+                mawfs info
+                    Show information about the instance.
+                mawfs traverse <branch>
+                    Traverse the entirety or a subset of the given branch.
+                    Traversal serves two purposes: 1) it verifies all chunks of
+                    the filesystem and 2) it pulls any missing/invalid chunks from
+                    peers.  See the --traverse-type (-t) opton for details on the
+                    types of traversal that are available.
+                mawfs help
+                    Show this help message.
+
+            Options:
+            `
+        );
+    }
+
+
+}
+
+# The main function, which is a command dispatcher.
+void main() {
+    args := opts.parse();
+    cm := CommandManager(args);
+
+    # If we get a --version flag, print the version and quit.
+    if (opts.getBool('version')) {
+        cout `$VERSION\n`;
+        exit(0);
+    }
+
+    # Check for the help flag.
+    if (opts.getBool('help')) {
+        cm.usage();
+        exit(0);
+    }
+
+    if (args.count() < 2) {
+        cm.usage();
+        exit(1);
+    }
+
+    cm.initLogs();
+
+    try {
+        cmd := args[1];
+        if (cmd == 'commit') {
+            cm.commit();
+        } else if (cmd == 'create') {
+            cm.create();
+        } else if (cmd == 'clone') {
+            cm.clone();
+        } else if (cmd == 'run') {
+            cm.run();
+        } else if (cmd == 'dump_backing') {
+            cm.dumpBacking();
+        } else if (cmd == 'dump') {
+            cm.dump();
+        } else if (cmd == 'pull') {
+            cm.pull();
+        } else if (cmd == 'push') {
+            cm.push();
+        } else if (cmd == 'merge') {
+            cm.merge();
+        } else if (cmd == 'resolve') {
+            cm.resolve();
+        } else if (cmd == 'cancelMerge') {
+            cm.cancelMerge();
+        } else if (cmd == 'addPeer') {
+            cm.addPeer();
+        } else if (cmd == 'dbg_log') {
+            cm.dbg_log();
+        } else if (cmd == 'dump_commit') {
+            cm.dump_commit();
+        } else if (cmd == 'load_branch') {
+            cm.load_branch();
+        } else if (cmd == 'dump_node') {
+            cm.dump_node();
+        } else if (cmd == 'info') {
+            cm.info();
+        } else if (cmd == 'verify') {
+            cm.verify();
+        } else if (cmd == 'traverse') {
+            cm.traverse();
+        } else if (cmd == 'log') {
+            cm.log();
+        } else if (cmd == 'help') {
+            cm.usage();
+            exit(0);
+        } else {
+            cerr `Unknown command: $cmd\n`;
+            cm.usage();
+            exit(1);
+        }
+    } catch (Abort ex) {
+        cerr `$(ex.text)\n`;
+        exit(1);
+    } catch (SystemError ex) {
+        cerr `system error: $ex\n`;
+        error `$(ex.text)`;
+        exit(1);
+    } catch (InvalidArgumentError ex) {
+        cerr `invalid argument: $ex\n`;
+        error `$(ex.text)`;
+        exit(1);
+    } catch (Exception ex) {
+        cerr `general exception: $ex\n`;
+        error `got general exception: $ex\n`;
+        exit(1);
+    }
+}
+
+main();

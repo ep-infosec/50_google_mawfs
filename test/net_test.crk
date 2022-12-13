@@ -1,0 +1,557 @@
+# Copyright 2016 Google Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import crack.cont.array Array;
+import crack.cont.hashmap HashMap;
+import crack.fs makePath, Path;
+import crack.hash.sha256 SHA256;
+import crack.io cerr, FStr;
+import crack.lang Exception;
+import crack.logger cerrLogger, info, setLogFile, setLogLevel, DEBUG;
+import crack.logger.ctx Log;
+import crack.net InetAddress;
+import crack.net.comm2 Comm;
+import crack.runtime sleep;
+import crack.sys argv;
+import crack.threads Mutex;
+
+import mawfs.blockstore ChunkStore, Commit, FSInfo, Node, NodeStore, MODE_DIR;
+import mawfs.cache Tree;
+import mawfs.ciphers Cipher;
+import mawfs.flows MAWFSInstance;
+import mawfs.inst InstanceState;
+import mawfs.path MAWFSPath;
+import mawfs.peernet PeerNetwork, RemoteReaderImpl;
+import mawfs.params ParamInfo;
+import mawfs.rpc ExtendedAddress, PeerProxy;
+import mawfs.testutil FakeEntropySource;
+import test.unittest register, runAllTests, Test;
+
+@import crack.ann assert;
+
+String expandPassword(String pw) {
+    hasher := SHA256();
+    hasher.update(pw);
+    return hasher.digest();
+}
+
+const MASTER_PORT := 9130;
+const SLAVE_PORT := 9131;
+const PASSWORD := expandPassword('password');
+
+class PeerInfo {
+    Path backDir;
+    int port;
+    PeerNetwork peerNet;
+    ChunkStore cs;
+    Mutex mutex = {};
+    InstanceState instState;
+    Cipher cipher;
+
+    oper init(Path backDir, int port) : backDir = backDir, port = port {}
+
+    void create() {
+        if (backDir.exists())
+            backDir.deleteTree();
+        backDir.makeDirs();
+
+        # Create params and chunk store.
+        params := ParamInfo.getDefault(PASSWORD);
+        params.writeTo((backDir/'params').writer(), FakeEntropySource(10));
+        cipher = params.cipher;
+        cs = ChunkStore(backDir, FSInfo(cipher));
+
+        instState = InstanceState.create(backDir, cipher, cs, 'master', mutex,
+                                         null
+                                         );
+
+        # Create the peer network.
+        chunkReader := cs.getRawChunkReader(mutex);
+        inst := MAWFSInstance(instState);
+        peerNet = PeerNetwork(chunkReader, cipher, 'name', inst);
+
+        # Set up a remote reader.
+        cs.setRemoteReader(RemoteReaderImpl(peerNet));
+
+        peerNet.addServer(ExtendedAddress('localhost', 127, 0, 0, 1, port,
+                                          false
+                                          )
+                          );
+    }
+
+    void makeBranch(String branch) {
+        rootNode := Node();
+        rootNode.mode = MODE_DIR;
+        rootDigest := cs.storeNode(rootNode);
+
+        commit := Commit();
+        commit.root = rootDigest;
+        commitDigest := cs.storeCommit(commit);
+        cs.setHead(branch, commitDigest);
+    }
+
+    ## Returns a Path object for the root of the head of 'branch'.
+    MAWFSPath getRoot(String branch) {
+        # Otherwise just construct one from the chunk store.
+        tree := Tree(cs, branch);
+        return MAWFSPath(tree.getRoot());
+    }
+
+    ## Returns the root from the instance state (you must have set the
+    ## instance state to be able to use this)
+    Path getRoot() {
+        lock := instState.lock();
+        return instState.getRoot();
+    }
+
+    void commit(String branch) {
+        Tree(cs, branch).commit();
+    }
+
+    void shutdown() {
+        # Break the reference cycle that I don't really understand.
+        cs.setRemoteReader(null);
+        peerNet.shutdown();
+    }
+}
+
+@abstract class TestBed : Test {
+
+    Path root;
+    PeerInfo master, slave;
+    Comm comm;
+    PeerProxy proxy;
+
+    void createMaster() {
+        backDir := root/'back0';
+        master = PeerInfo(backDir, MASTER_PORT);
+        master.create();
+    }
+
+    void createSlave() {
+        backDir := root/'back1';
+        slave = PeerInfo(backDir, SLAVE_PORT);
+        slave.create();
+    }
+
+    int getPort() { return SLAVE_PORT }
+
+    void setUp() {
+        root = makePath('tmp');
+        createMaster();
+        createSlave();
+        slave.peerNet.addPeer('peer',
+                              ExtendedAddress('localhost', 127, 0, 0, 1,
+                                              MASTER_PORT,
+                                              false
+                                              )
+                              );
+
+        log := Log(cerrLogger, 'client-proxy');
+        comm = Comm(log);
+        comm.start();
+        proxy = PeerProxy.make(
+            comm,
+            log,
+            InetAddress(127, 0, 0, 1, getPort()),
+            null
+        );
+        proxy.login(slave.cipher);
+    }
+
+    void tearDown() {
+        master.shutdown();
+        slave.shutdown();
+        proxy.shutdown();
+        comm.stop();
+        comm = null;
+        proxy = null;
+    }
+}
+
+setLogFile('net_test.log');
+setLogLevel(DEBUG);
+
+class ServerConnectionsTest : TestBed {
+    int getPort() { return MASTER_PORT }
+    void run() {
+        @assert(proxy.getFile('params') == (master.backDir/'params').readAll());
+    }
+}
+register(ServerConnectionsTest());
+
+const FILE_CONTENTS := 'Test File!';
+
+class FetchTest : TestBed {
+    void run() {
+        master.makeBranch('foo');
+
+        branchName := proxy.pullBranch('foo', null);
+        @assert(branchName == 'foo');
+
+        # Create a branch with a journal.
+        master.makeBranch('bar');
+        (master.getRoot('bar')/'temp.txt').writeAll(FILE_CONTENTS);
+
+        branchName = proxy.pullBranch('bar', null);
+        @assert(branchName == 'bar');
+        @assert((slave.getRoot('bar')/'temp.txt').readAll() == FILE_CONTENTS);
+
+        # Pull from the same branch again after making changes to it.  We
+        # should just get the latest from the new branch, since there are no
+        # changes to the local one.
+        (master.getRoot('bar')/'moar.txt').writeAll(FILE_CONTENTS);
+        branchName = proxy.pullBranch('bar', null);
+        @assert(branchName == 'bar');
+        @assert((slave.getRoot('bar')/'moar.txt').readAll() ==
+                FILE_CONTENTS
+                );
+
+        # Extend the local journal, verify that it doesn't get changed.
+        (slave.getRoot('bar')/'evenmoar.txt').writeAll(FILE_CONTENTS);
+        branchName = proxy.pullBranch('bar', null);
+        @assert(branchName == 'bar');
+        @assert((slave.getRoot('bar')/'evenmoar.txt').readAll() ==
+                FILE_CONTENTS
+                );
+
+        # Extend the remote journal incompatibly.
+        (master.getRoot('bar')/'evilmoar.txt').writeAll(FILE_CONTENTS);
+        branchName = proxy.pullBranch('bar', null);
+        @assert(branchName != 'bar');
+        @assert(!(slave.getRoot('bar')/'evilmoar.txt').exists());
+        @assert((slave.getRoot(branchName)/'evilmoar.txt').readAll() ==
+                FILE_CONTENTS
+                );
+    }
+}
+register(FetchTest());
+
+# Verify that we do the right thing when fetching from branches based on
+# completely different commits.
+class DiffCommitsTest : TestBed {
+    void run() {
+        master.makeBranch('foo');
+        @assert(proxy.pullBranch('foo', null) == 'foo');
+
+        # Verify that a second pull shows up as the same.
+        @assert(proxy.pullBranch('foo', null) == 'foo');
+
+        # Verify that a new descendant commit subsumes the branch when there
+        # is no local journal.
+        (master.getRoot('foo')/'test').writeAll(FILE_CONTENTS);
+        master.commit('foo');
+        @assert(proxy.pullBranch('foo', null) == 'foo')
+        @assert((slave.getRoot('foo')/'test').readAll() == FILE_CONTENTS);
+
+        # Verify that a new local commit is left intact if the remote commit
+        # is older.
+        (slave.getRoot('foo')/'localFile').writeAll(FILE_CONTENTS);
+        slave.commit('foo');
+        @assert(proxy.pullBranch('foo', null) == 'foo');
+        @assert((slave.getRoot('foo')/'localFile').readAll() == FILE_CONTENTS);
+
+        # Verify that we now branch on a new remote commit.
+        (master.getRoot('foo')/'branchFile').writeAll(FILE_CONTENTS);
+        master.commit('foo');
+        newBranch := proxy.pullBranch('foo', null);
+        @assert(newBranch != 'foo');
+        @assert((slave.getRoot(newBranch)/'branchFile').readAll() ==
+                FILE_CONTENTS
+                );
+
+        # Verify that a new journal gets propagated correctly.
+        (master.getRoot('foo')/'branchFile2').writeAll(FILE_CONTENTS);
+        newBranch = proxy.pullBranch('foo', null);
+        @assert(newBranch != 'foo');
+        @assert((slave.getRoot(newBranch)/'branchFile2').readAll() ==
+                FILE_CONTENTS
+                );
+
+        # Verify that all this works if both have journals
+        (slave.getRoot('foo')/'localFile2').writeAll(FILE_CONTENTS);
+        newBranch = proxy.pullBranch('foo', null);
+        @assert(newBranch != 'foo');
+        @assert((slave.getRoot(newBranch)/'branchFile2').readAll() ==
+                FILE_CONTENTS
+                );
+
+        # Verify that we pull correctly on different commits if only the slave
+        # has a journal.
+        master.commit('foo');
+        newBranch = proxy.pullBranch('foo', null);
+        @assert(newBranch != 'foo');
+        @assert((slave.getRoot(newBranch)/'branchFile2').readAll() ==
+                FILE_CONTENTS
+                );
+    }
+}
+register(DiffCommitsTest());
+
+class JournalledCompatibleCommits : TestBed {
+    void run() {
+        master.makeBranch('foo');
+        @assert(proxy.pullBranch('foo', null) == 'foo');
+
+        # Verify that a new commit with a journal on the master works like an
+        # extension if slave doesn't have a journal.
+        (master.getRoot('foo')/'firstFile').writeAll(FILE_CONTENTS);
+        master.commit('foo');
+        (master.getRoot('foo')/'secondFile').writeAll(FILE_CONTENTS);
+        newBranch := proxy.pullBranch('foo', null);
+        @assert(newBranch == 'foo');
+    }
+}
+register(JournalledCompatibleCommits());
+
+# This can be merged into the test above as soon as we can recognize that a
+# commit is derived from a journal entry.  Then we can resync the two branches
+# in the prior test.
+class JournalledCompatibleCommits2 : TestBed {
+    void run() {
+        master.makeBranch('foo');
+        @assert(proxy.pullBranch('foo', null) == 'foo');
+
+        # Verify that we don't create a tracking branch in cases where there
+        # is a local commit with a journal that extends a remote commit
+        # without a journal.
+        (slave.getRoot('foo')/'firstFile').writeAll(FILE_CONTENTS);
+        slave.commit('foo');
+        (slave.getRoot('foo')/'secondFile').writeAll(FILE_CONTENTS);
+        newBranch := proxy.pullBranch('foo', null);
+        @assert(newBranch == 'foo');
+    }
+}
+register(JournalledCompatibleCommits2());
+
+## Verify that we don't create a new branch for a reote commit derived
+## entirely from a journal that we haven't modified.
+class CommitFromKnownJournal : TestBed {
+    void run() {
+        master.makeBranch('foo');
+        (master.getRoot('foo')/'firstFile').writeAll(FILE_CONTENTS);
+        @assert(proxy.pullBranch('foo', null) == 'foo');
+
+        master.commit('foo');
+        @assert(proxy.pullBranch('foo', null) == 'foo');
+        @assert((slave.getRoot('foo')/'firstFile').readAll() ==
+                FILE_CONTENTS
+                );
+
+        # Pull the branch, then write again to master an commit - since the
+        # all of the sessions in the local branch should still be contained in
+        # the commit, we should not fork.
+        (master.getRoot('foo')/'secondFile').writeAll(FILE_CONTENTS);
+        @assert(proxy.pullBranch('foo', null) == 'foo');
+        (master.getRoot('foo')/'thirdFile').writeAll(FILE_CONTENTS);
+        master.commit('foo');
+        @assert(proxy.pullBranch('foo', null) == 'foo');
+
+        # Write another change, pull and diverge.  At this point, pulling the
+        # commit should result in a fork.
+        (master.getRoot('foo')/'fourthFile').writeAll(FILE_CONTENTS);
+        @assert(proxy.pullBranch('foo', null) == 'foo');
+        (master.getRoot('foo')/'masterFile').writeAll(FILE_CONTENTS);
+        master.commit('foo');
+        (slave.getRoot('foo')/'slaveFile').writeAll(FILE_CONTENTS);
+        newBranch := proxy.pullBranch('foo', null);
+        @assert(newBranch != 'foo')
+        @assert((slave.getRoot('foo')/'slaveFile').readAll() == FILE_CONTENTS);
+        @assert(!(slave.getRoot('foo')/'masterFile').exists());
+        @assert((slave.getRoot(newBranch)/'masterFile').readAll() == FILE_CONTENTS);
+        @assert(!(slave.getRoot(newBranch)/'slaveFile').exists());
+    }
+}
+register(CommitFromKnownJournal());
+
+class CommitAfterCommitFromKnownJournal : TestBed {
+    void run() {
+        master.makeBranch('foo');
+        (master.getRoot('foo')/'firstFile').writeAll(FILE_CONTENTS);
+        @assert(proxy.pullBranch('foo', null) == 'foo');
+
+        master.commit('foo');
+        (master.getRoot('foo')/'secondFile').writeAll(FILE_CONTENTS);
+        master.commit('foo');
+        @assert(proxy.pullBranch('foo', null) == 'foo');
+    }
+}
+register(CommitAfterCommitFromKnownJournal());
+
+class MergeTest : TestBed {
+    void run() {
+        master.makeBranch('foo');
+        proxy.pullBranch('foo', null);
+
+        (master.getRoot('foo')/'masterFile').writeAll(FILE_CONTENTS);
+        master.commit('foo');
+        proxy.pullBranch('foo', null);
+
+        NodeStore store;
+        if (true) {
+            lock := slave.instState.lock();
+            store = slave.instState.getStore();
+        }
+        commits := Array[String]![store.getHead('master'),
+                                  store.getHead('foo')
+                                  ];
+
+        result := proxy.merge('foo');
+        @assert(result.mergeBranch is null);
+        @assert(!(slave.getRoot()/'.mawfs'/'alt'/'foo').exists());
+
+        # We should have two parents, the base commit of the target and
+        slave.instState.resetTree();
+        commit := store.getCommit(store.getHead('master'));
+        assertEqual(commit.parent, commits);
+    }
+}
+register(MergeTest());
+
+@abstract class ConflictTestBase : TestBed {
+    NodeStore store;
+    String baseCommit;
+
+    void setUp() {
+        TestBed.setUp();
+
+        master.makeBranch('master');
+        (master.getRoot('master')/'dir').makeDir();
+        proxy.pullBranch('master', null);
+        if (true) {
+            lock := slave.instState.lock();
+            store = slave.instState.getStore();
+        }
+        baseCommit = store.getHead('master');
+
+        # Cause a divergence.
+        (master.getRoot('master')/'dir'/'conflict').writeAll('some data');
+        (slave.getRoot('master')/'dir'/'conflict').writeAll('other data');
+
+        # Reset the slave's instance state (getRoot() creates its own tree).
+        slave.instState.resetTree();
+    }
+}
+
+class ConflictsTest : ConflictTestBase {
+    void run() {
+        # Merge, verify there were conflicts.
+        altBranch := proxy.pullBranch('master', null);
+        result := proxy.merge(altBranch);
+        assertEqual(result.conflict, Array[String]!['dir/conflict']);
+
+        slave.instState.resetTree();
+        alt := slave.getRoot()/'.mawfs'/'alt';
+        @assert((alt/altBranch).exists());
+        @assert((alt/'merge:org').exists());
+
+        # Verify that the merge branch exists in the store.
+        @assert(store.getHead(result.mergeBranch));
+        @assert(store.makeJournalIter(result.mergeBranch));
+
+        # Rewrite the conflicted file.
+        (slave.getRoot()/'dir'/'conflict').writeAll(
+            'some data or other');
+        proxy.resolve();
+
+        # Verify that the resident branches for the merge have been cleaned up.
+        slave.instState.resetTree();
+        alt = slave.getRoot()/'.mawfs'/'alt';
+        @assert(!(alt/'merge:org').exists());
+        @assert(!(alt/altBranch).exists());
+
+        # Verify that we've ended up with the final data.
+        assertEqual((slave.getRoot()/'dir'/'conflict').readAll(),
+                    'some data or other'
+                    );
+
+        # Verify that the current branch is "master".
+        lock := slave.instState.lock();
+        assertEqual(slave.instState.getBranch(), 'master');
+
+        # verify that we have a new commit and no journal.
+        @assert(!store.makeJournalIter('master'));
+        commit := store.getCommit(store.getHead('master'));
+
+        # It should have 1 parent (because we didn't commit on either side).
+        @assert(commit.parent.count() == 1);
+        assertEqual(commit.parent[0], baseCommit);
+
+        # Verify that the merge branch has been removed.
+        assertEqual(store.getHead(result.mergeBranch), null);
+        @assert(!store.makeJournalIter(result.mergeBranch));
+    }
+}
+register(ConflictsTest());
+
+# XXX need a test to verify that we don't clobber a branch that we've
+# previously pulled.
+
+class MergeFromTwoCommits : ConflictTestBase {
+    void run() {
+        master.commit('master');
+        slave.commit('master');
+        slaveCommit := store.getHead('master');
+        slave.instState.resetTree();
+
+        # Merge.
+        altBranch := proxy.pullBranch('master', null);
+        proxy.merge(altBranch);
+        proxy.resolve();
+
+        commit := store.getCommit(store.getHead('master'));
+        @assert(commit.parent.count() == 2);
+        assertEqual(commit.parent[0], slaveCommit);
+    }
+}
+register(MergeFromTwoCommits());
+
+class CancelMergeTest : ConflictTestBase {
+    void run() {
+        altBranch := proxy.pullBranch('master', null);
+        proxy.merge(altBranch);
+
+        # Make a change.
+        (slave.getRoot()/'local_change').writeAll('some data');
+        @assert((slave.getRoot()/'local_change').exists());
+
+        proxy.cancelMerge();
+
+        # Should have discarded the local change.
+        @assert(!(slave.getRoot()/'local_change').exists());
+
+        # Should be no resident branches and the current branch should be
+        # master.
+        @assert(!(slave.getRoot()/'.mawfs'/'alt').children());
+        lock := slave.instState.lock();
+        assertEqual(slave.instState.getBranch(), 'master');
+    }
+}
+register(CancelMergeTest());
+
+class AddPeerTest : TestBed {
+    void run() {
+        proxy.addPeer('master', FStr() `127.0.0.1:$(master.port)`);
+        assertEqual(
+            (slave.backDir/'config/peers').readAll(),
+            I'
+            [peer-master]
+            host = 127.0.0.1
+            port = 9130
+            ');
+    }
+}
+register(AddPeerTest());
+
+runAllTests();

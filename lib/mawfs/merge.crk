@@ -1,0 +1,492 @@
+# Copyright 2018 Google Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+## The merge tool.
+
+import crack.cont.array Array;
+import crack.cont.treemap TreeMap;
+import crack.enc.base64 altEncode;
+import crack.io cerr, Formatter;
+import crack.io.fmtutil Indenter;
+import crack.lang cmp, makeHashVal, AppendBuffer;
+import crack.logger info;
+import crack.protobuf Field, Message, ProtoWriter;
+import crack.strutil StringArray;
+import mawfs.cache getPosixTime, sig, CachedNode, Head;
+
+@import crack.ann assert, impl, struct;
+@import crack.protobuf.ann protobuf;
+
+int _cmp(CachedNode a, CachedNode b) {
+    return cmp(uintz(a), uintz(b));
+}
+
+class Conflict;
+
+## The outcome of a merge operation.
+@abstract class Outcome {
+
+    ## Apply the outcome to the parent node.
+    ## parent:
+    ## name: Name that the node is known to the parent as.
+    ## parentConflicts: a conflict object being constructed by the parent.
+    @abstract void apply(CachedNode parent, String name,
+                         Conflict parentConflicts
+                         );
+
+    ## Get the revised node for the specified target node.
+    @abstract CachedNode get(CachedNode target);
+}
+
+## Indicates a conflict.
+class Conflict : Outcome {
+
+    ## Represents a tree of conflicting file names.
+    ## VisibleForTesting.
+    class NameTree {
+        alias __Map = TreeMap[String, NameTree];
+        __Map __children = {};
+
+        class Iter {
+            alias __Seq = Array[TreeMap[String, NameTree].Iter];
+            __Seq __cur;
+
+            void __extendCursor() {
+                # I don't think this can happen in the fixit case.
+                @assert(__cur[-1]);
+
+                while (true) {
+                    @assert(__cur[-1]);
+                    item := __cur[-1].elem();
+                    if (!item.val)
+                        break;
+                    __cur.append(item.val.__children.iter());
+                }
+            }
+
+            oper init(__Map map) : __cur = __Seq![map.iter()] {
+                # Initialize the cursor by descending into the tree.
+                __extendCursor();
+            }
+
+            bool isTrue() { return __cur }
+
+            # THe elem of an iterator is a full path name.
+            String elem() {
+                StringArray result = {__cur.count()};
+                for (iter :in __cur)
+                    result.append(iter.elem().key);
+                return result.join('/');
+            }
+
+            bool next() {
+                if (!__cur)
+                    return false;
+
+                # Just try incrementing the last iterator.
+                if (__cur[-1].next()) {
+                    __extendCursor();
+                    return true;
+                }
+
+                # Otherwise, pop it and try the next one.
+                while (true) {
+                    __cur.pop();
+                    if (__cur) {
+                        __cur[-1].next();
+                        if (!__cur[-1])
+                            continue;
+                        __extendCursor();
+                        return true;
+                    } else {
+                        return false;
+                    }
+                }
+                return false;  # Should be unreachable.
+            }
+
+            Iter iter() { return this }
+        }
+
+        bool isTrue() { return __children }
+
+        @final Iter iter() { return Iter(__children) }
+
+        @struct Entry {
+            String key;
+            NameTree val;
+        }
+
+        @final void append(Entry entry) { __children[entry.key] = entry.val }
+
+        ## Add a simple name (a "leaf node") to the tree at this level.
+        @final void addName(String name) { __children[name] = null }
+
+        ## Add a child tree.
+        @final void add(String name, NameTree child) {
+            __children[name] = child;
+        }
+
+        void formatTo(Formatter out) {
+            for (item :in __children)
+                out `$(item.key):\n  $(item.val)\n`;
+        }
+    }
+
+    NameTree __names = {};
+
+    oper init() {}
+
+    ## Add a new name to the list of conflicts.
+    void add(String name) { __names.addName(name) }
+
+    void add(String name, Conflict child) { __names.add(name, child.__names) }
+
+    void apply(CachedNode parent, String name, Conflict parentConflicts) {
+        if (__names)
+            parentConflicts.add(name, this);
+        else
+            parentConflicts.add(name);
+    }
+
+    CachedNode get(CachedNode target) { return target }
+
+    int cmp(Conflict other) {
+        return 0;
+    }
+
+    int cmp(Object other) {
+        if ((o := Conflict.cast(other, null)) != null)
+            return cmp(o);
+        else
+            return Object.cmp(other);
+    }
+
+    bool isTrue() { return __names }
+    @final NameTree.Iter iter() { return __names.iter() }
+    void formatTo(Formatter out) {
+        out `Conflict{\n`;
+        __names.formatTo(out);
+        out `}\n`;
+    }
+}
+
+## A mutation is when we can simply replace an existing object with the new
+## object.
+class Mutation : Outcome {
+    CachedNode replacement;
+    oper init(CachedNode replacement) : replacement = replacement {}
+
+    int cmp(Mutation mut) {
+        return _cmp(replacement, mut.replacement);
+    }
+
+    int cmp(Object other) {
+        if (o := Mutation.cast(other, null))
+            return cmp(o);
+        else
+            return Object.cmp(other);
+    }
+
+    void formatTo(Formatter out) {
+        indent := Indenter.wrap(out);
+        indent `Mutation{\n`;
+        ++indent;
+        indent `$replacement\n`;
+        --indent;
+        indent `}\n`;
+    }
+
+    void apply(CachedNode parent, String name, Conflict parentConflicts) {
+        clone := replacement.copy(parent.getContext());
+        parent.addChild(name, clone, getPosixTime());
+    }
+
+    CachedNode get(CachedNode target) {
+        return replacement.copy(target.getContext());
+    }
+}
+
+## As the name implies, this is returned when both result trees are identical.
+##
+## Since this needs no parameters, it is a singleton.
+class Unchanged : Outcome {
+    void apply(CachedNode parent, String name, Conflict parentConflicts) {}
+    CachedNode get(CachedNode target) { return target }
+    void formatTo(Formatter out) { out `Unchanged\n` }
+
+}
+const UNCHANGED := Unchanged();
+
+## Do a 3-way merge of 'other' into 'target'.
+Outcome merge3(CachedNode target, CachedNode org, CachedNode other) {
+    # If they're the same, we're done.
+    if (other == target)
+        return UNCHANGED;
+
+    # If the target is the same as the parent, we can accept the change in
+    # 'other'.
+    if (target == org)
+        return Mutation(other);
+
+    # If 'other' is the same as the parent, we accept target's change.
+    else if (other == org)
+        return UNCHANGED;
+
+    # From here on in, we deal with the case where the node has "forked" in
+    # two different directions from the parent.
+
+    if (target && target.isDir()) {
+        # target is a directory.
+
+        # If other isn't, we're done.
+        if (!other || !other.isDir())
+            return Conflict();
+
+        # Compare all children.
+        Conflict conflicts = {};
+        for (int i = 0; i < target.getChildCount(); ++i) {
+            name := target.getChildName(i);
+            child := target.getChild(i);
+            orgChild := org ? org.getChild(name) : null;
+            otherChild := other ? other.getChild(name) : null;
+
+            # If this child was added in target, we're good.
+            # XXX I think this is just a optimization for the next step.
+            if (!orgChild && !otherChild)
+                continue;
+
+            # Merge the child.
+            childOutcome := merge3(child, orgChild, otherChild);
+            childOutcome.apply(target, name, conflicts);
+        }
+
+        # Now go through all children in other that aren't in target.
+        for (int i = 0; i < other.getChildCount(); ++i) {
+            name := other.getChildName(i);
+            if (target.getChild(name))
+                # We covered this in the last loop.
+                continue;
+
+            orgChild := org ? org.getChild(name) : null;
+            otherChild := other.getChild(i);
+            childOutcome := merge3(null, orgChild, otherChild);
+            childOutcome.apply(target, name, conflicts);
+        }
+
+        # If we accumulated conflicts, return those.  Otherwise return
+        # unchanged. (these seems counter-intuitive, since we have have
+        # actually applied changes to target, but the fact is that no changes
+        # need to be applied to any of the ancestors)
+        if (conflicts)
+            return conflicts;
+        else
+            return UNCHANGED;
+
+    } else {
+        # target is a file.  Regardless of what 'other' is, merging is now out
+        # of scope.
+        return Conflict();
+    }
+}
+
+## Keeps track of the current state of a pending merge.
+@protobuf {
+    version = 1
+
+    message MergeState {
+
+        ## The name of the target branch (the branch that we started from and
+        ## that the instance is merging into).
+        optional string targetBranch = 1;
+
+        ## Tha name of the merge branch.  This is a name of the form
+        ## "merge:<digest>".
+        optional string mergeBranch = 2;
+
+        ## Tha neme of the other branch (the one that we are merging).
+        optional string otherBranch = 3;
+
+        ## The digest of the baseline commit of the target branch.
+        optional string targetCommit = 4;
+
+        ## The digest of the baseline commit of the other branch.
+        optional string otherCommit = 5;
+
+        ## The digest of the last change in the journal of the target branch,
+        ## null if there is no journal.
+        optional string targetChange = 6;
+
+        ## The digest of the last change in the journal of the other branch,
+        ## null if there is no journal.
+        optional string otherChange = 7;
+
+        ## The branch name and change digest of the origin node.  'orgChange'
+        ## may be omitted if the origin is at the head of the branch.
+        optional string orgBranch = 8;
+        optional string orgChange = 9;
+    }
+}
+
+## Merges three root nodes into a single filesystem.
+##
+## Usage:
+##    merger := Merger(target, org, other).merge();
+##
+## Details of the merge are stored in the attributes of the resulting Merger.
+@final class Merger {
+    CachedNode target, org, other;
+
+    ## The original branch name of the target.
+    String orgBranch;
+
+    ## The "new root" node.  Callers should use this in replacement of
+    ## 'target'.
+    CachedNode newRoot;
+
+    ## nullable, if present this contains the conflict information.
+    Conflict conflict;
+
+    ## nullable, if present this contains the merge branch name.  If null,
+    ## there were no conflicts and the merge was fully committed.
+    String branch;
+
+    String __targetCommit, __otherCommit, __targetChange, __otherChange,
+        __orgChange;
+
+    ## target: The root of the head of a branch.  The merge will be performed
+    ##     on this object, it will be mutated to contain any changed files
+    ##     from 'other' that can be merged without conflct.
+    ## org: The root of the nearest tree that both 'target' and 'other' are
+    ##     derived from.
+    ## other: The root of a tree that has diverged from 'target'.
+    oper init(CachedNode target, CachedNode org, CachedNode other) :
+        target = target,
+        org = org,
+        other = other {
+
+        orgBranch = org.getContext().getBranch();
+        targetCtx := target.getContext();
+        otherCtx := other.getContext();
+        orgCtx := org.getContext();
+        __targetCommit = targetCtx.getBaselineCommit();
+        __otherCommit = otherCtx.getBaselineCommit();
+        __targetChange = targetCtx.getLastChange();
+        __otherChange = otherCtx.getLastChange();
+        __orgChange = orgCtx.getLastChange();
+    }
+
+    ## Restore the Merger from the merge state.  This is for use by
+    ## mawfs.inst.InstanceState.makeMerger().
+    oper init(CachedNode target, CachedNode org, CachedNode other,
+              MergeState mergeState) :
+        target = target,
+        org = org,
+        other = other {
+        orgBranch = mergeState.targetBranch;
+        branch = mergeState.mergeBranch;
+        __targetCommit = mergeState.targetCommit;
+        __otherCommit = mergeState.otherCommit;
+        __targetChange = mergeState.targetChange;
+        __otherChange = mergeState.otherChange;
+        orgBranch = mergeState.orgBranch;
+        __orgChange = mergeState.orgChange;
+
+        # In this case, the new root is the target root.
+        newRoot = target;
+    }
+
+    ## Creates a new merge branch and converts "target" to it.
+    ##
+    ## This must be called before merge().  After it's completed, changes in
+    ## the merge are expected to be applied directly to the new branch.
+    void createMergeBranch() {
+        @assert(!branch && !newRoot);
+        # The new branch name is a hash constructed from the digests of the
+        # hashes of the target branch and the other branch.
+        String getBranchHash(Head head) {
+            return head.lastChange ? head.lastChange : head.baselineCommit;
+        }
+        targetDigest := target.getContext().getBranchDigest();
+        otherDigest := other.getContext().getBranchDigest();
+
+        # Just xor the two digests together and alt-encode them.
+        name := AppendBuffer(targetDigest.count());
+        @assert(otherDigest.count() >= targetDigest.count());
+        for (int i = 0; i < targetDigest.count(); ++i)
+            name.append(targetDigest[i] ^ otherDigest[i]);
+
+        # Get the journal iterators for both of the branches being merged.
+        ctx := target.getContext();
+        targetJiter := ctx.makeJournalIter();
+        otherJiter := other.getContext().makeJournalIter();
+
+        # Set the branch to the new merge branch and set the head to the base
+        # digest.
+        branch = 'merge:' + altEncode(name);
+        ctx.setBranch(branch);
+        ctx.setHead(ctx.getBaselineCommit());
+
+        # Copy the journal from the target to the new branch.
+        for (changeEntry :in targetJiter)
+            ctx.addChange(changeEntry.change);
+    }
+
+    ## Do a commit on the target branch.
+    void commit() {
+        # Copy the session ids from the other context.
+        ctx := newRoot.getContext();
+        ctx.copySessionIds(other.getContext());
+        ctx.setBranch(orgBranch);
+
+        # Do a single parent or double-parent commit as appropriate.
+        if (__otherCommit == __targetCommit)
+            newRoot.commitTree();
+        else
+            newRoot.commitTree(__otherCommit, null);
+    }
+
+    ## Performs the merge, returns a Merger object containing the details of
+    ## the merge.
+    ##
+    ## Must be called after createMergeBranch()
+    Merger merge() {
+        if (!branch)
+            createMergeBranch();
+        outcome := merge3(target, org, other);
+        newRoot = outcome.get(target);
+        if (!outcome.isa(Conflict)) {
+            # There were no conflicts.  We can commit on the current branch.
+            commit();
+            return this;
+        }
+        conflict = Conflict.cast(outcome);
+        return this;
+    }
+
+    ## Returns the MergeState for the merge.
+    MergeState getState() {
+        result := MergeState();
+        result.targetBranch = orgBranch;
+        result.mergeBranch = branch;
+        result.otherBranch = other.getContext().getBranch();
+        result.targetCommit = __targetCommit;
+        result.otherCommit = __otherCommit;
+        result.targetChange = __targetChange;
+        result.otherChange = __otherChange;
+        result.orgBranch = orgBranch;
+        result.orgChange = __orgChange;
+        return result;
+    }
+}

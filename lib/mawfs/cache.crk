@@ -1,0 +1,2771 @@
+# Copyright 2016 Google Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+## The node cache.
+module;
+
+import crack.enc.base64 altEncode;
+import crack.cont.hashmap HashMap;
+import crack.io.fmtutil Indenter;
+import crack.io Formatter, FStr, Reader, Writer;
+import crack.cont.array Array;
+import crack.fieldset HashMapFieldSet;
+import crack.functor Functor1;
+import crack.lang cmp, AppendBuffer, AssertionError, Buffer, Exception,
+    InvalidArgumentError, InvalidStateError, KeyError, ManagedBuffer,
+    WriteBuffer, makeHashVal;
+import crack.logger debug, error, info;
+import crack.serial SerialReader, SerialWriter;
+import crack.strutil StringArray;
+import crack.time Time;
+import mawfs.blockstore Entry, Change, ChangeEntry, Commit, CommitMetadata,
+    JournalIter, Node, NodeStore, Session, MODE_DIR;
+import mawfs.chunker RabinChunker, DEFAULT_WINDOW_SIZE;
+import mawfs.dllist DLList;
+
+@import crack.ann assert, impl, interface, struct;
+
+String snippet(String content) {
+    if (content.size > 10)
+        return content.substr(0, 10).getRepr();
+    else
+        return content.getRepr();
+}
+
+const MEG := 1024 * 1024;
+
+# Allow initial blocks of up to one meg.
+const DEFAULT_MAX_CONTENT_SIZE := MEG;
+const DEFAULT_MAX_CHILDREN := 256;
+const DEFAULT_MAX_JOURNAL_SIZE := 16 * MEG;
+const DEFAULT_GC_THRESHOLD := 128 * MEG;
+const DEFAULT_GC_BOTTOM := 16 * MEG;
+
+const int32
+    ## Add child.
+    ## contains;
+    ## -   node or digest
+    ## -   name (add_child is only applied to a directory)
+    ## -   time (optional)
+    CHANGE_ADD_CHILD = 1,
+
+    ## Delete a child (contains a name and optionally a time).
+    CHANGE_DELETE_CHILD = 2,
+
+    ## Write data to node contents (respecting all current rules about file
+    ## size, layout etc).  Contains pos and data and (optionally) time.
+    CHANGE_WRITE = 3,
+
+    ## Resize node contents.  Contains newSize and (optionally) time.
+    CHANGE_RESIZE = 4,
+
+    ## Replace a child.
+    ## -    path is the path to the parent.
+    ## -    index is the index of the child within the parent.
+    ## -    node or digest.
+    ## -    time (optional)
+    CHANGE_REPLACE_CHILD = 5,
+
+    ## Set an attribute.
+    ## -    time (if provided) is the new mtime of the node.
+    CHANGE_SETATTR = 6;
+
+
+## Return the size of a node.
+uintz _getNodeSize(Node node) {
+    class End : VTableBase {}
+    class NodeSizer : Node, End {}
+    class EntryArraySizer : Array[Entry], End {}
+    class Ptr { voidptr p; }
+    class PtrSizer : Ptr, End {}
+    class EntrySizer : Entry, End {}
+    uintz sizeof(End end) { return uintz(end) }
+    class StringSizer : String, End {}
+    stringSize := sizeof(StringSizer.unsafeCast(null));
+
+    # Add the node size.
+    sz := sizeof(NodeSizer.unsafeCast(null));
+    if (!(node.contents is null))
+        sz += stringSize + node.contents.size;
+
+    # Add the child array.
+    if (!(node.children is null)) {
+        sz += sizeof(EntryArraySizer.unsafeCast(null));
+        sz += sizeof(PtrSizer.unsafeCast(null)) * node.children.count();
+        sz += sizeof(EntrySizer.unsafeCast(null)) * node.children.count();
+        for (child :in node.children) {
+            if (child.hash)
+                sz += stringSize + child.hash.size;
+            if (child.name)
+                sz += stringSize + child.name.size;
+        }
+    }
+    return sz;
+}
+
+## Returns the digest alt-encoded.  If 'digest' is null or empty, returns the
+## string "null".
+String sig(String digest) {
+    return digest ? altEncode(digest) : 'null';
+}
+
+## Returns the current time as seconds since the epoch.
+## This only lives in this module because it's convenient to the other mdoules
+## that use it.  Belongs in a module containing very general functions that
+## don't use anything else from mawfs, same as sig().
+int32 getPosixTime() {
+    return Time.now().secs;
+}
+
+## Thrown when we're unable to load a chunk.
+class MissingChunkError : Exception {
+    ## Constructs the error given a digest and a context (which may be null).
+    oper init(String digest, String context) :
+        Exception(FStr() `Missing chunk $(sig(digest))$(context ? context : '').`) {
+    }
+}
+
+class Cache {
+    NodeStore store;
+
+    uint maxContentSize = DEFAULT_MAX_CONTENT_SIZE;
+    uint maxChildren = DEFAULT_MAX_CHILDREN;
+    uint maxJournalSize = DEFAULT_MAX_JOURNAL_SIZE;
+
+    ## Cache size where we start doing GC.
+    uint gcThreshold = DEFAULT_GC_THRESHOLD;
+
+    ## Cache size where we stop doing GC.
+    uint gcBottom = DEFAULT_GC_BOTTOM;
+
+    ## A cached object.
+    @abstract class Obj {
+        Obj next, prev;
+
+        ## Returns true if the object can be safely released from the cache.
+        @abstract bool disposable();
+
+        ## Release the object so it can be freed from memory.
+        @abstract void release(Cache cache);
+
+        ## Returns the resident size of the object.
+        @abstract uintz getRSize();
+    }
+
+    # Node objects indexed by digest.
+    HashMap[String, Node] __nodes = {};
+
+    ## Callbacks to be invoked on object creation and destruction.  These are
+    ## intended for instrumentation purposes so we can verify that there have
+    ## been no memory leaks.
+    Functor1[void, Object] onObjCreate, onObjDestroy;
+
+    ## The least recently used list.  The first object on the list is the
+    ## least recently used, the last is the most recently used.  Objects are
+    ## removed from the head when we do garbage collection.
+    DLList[Obj] __oldest = {};
+
+    ## Run garbage collection.  'amount' is the number of bytes that we want
+    ## to release.
+    void garbageCollect() {
+        uintz amount = gcThreshold - gcBottom;
+        Obj cur = __oldest.head;
+        uintz amountPruned;
+        while (cur && amountPruned < amount) {
+            if (cur.disposable()) {
+                amountPruned += cur.getRSize();
+                tmp := cur;
+                cur = cur.next;
+                tmp.release(this);
+            } else {
+                cur = cur.next;
+            }
+        }
+    }
+
+    ## Wrapper for Node so we can include it in the cache.
+    class CachedRawNode : Cache.Obj {
+        String digest;
+        Node node;
+
+        oper init(String digest, Node node) : node = node {}
+
+        bool disposable() { return true }
+        void release(Cache cache) {
+            cache.__nodes.delete(digest);
+        }
+
+        uintz getRSize() { return _getNodeSize(node) }
+    }
+
+    ## Returns the node if it is in the cache, null if not.
+    @final Node getNode(String digest) {
+        return __nodes.get(digest);
+    }
+
+    @final void storeNode(String digest, Node node) {
+        if (!__nodes.hasKey(digest)) {
+            __nodes[digest] = node;
+            __oldest.append(CachedRawNode(digest, node));
+        }
+    }
+}
+
+class Head {
+
+    ## The digest of the last commit.  Changes in the journal are relative to
+    ## this.
+    String baselineCommit;
+
+    ## The digest of the last change.  This is null if there is no journal.
+    String lastChange;
+
+    ## The name of the branch.  "master" is the default branch.
+    String branch;
+
+    oper init(String branch, String baselineCommit) :
+        baselineCommit = baselineCommit,
+        branch = branch {
+    }
+}
+
+class CachedNode;
+class NodeContext;
+Object _makeOrphanContext(NodeContext context);
+
+@interface NodeWriter : Writer {
+    @abstract String commit();
+}
+
+## Creates a file that will be stored in the blockstore as a normal node tree.
+NodeWriter _makeWriteFile(NodeContext ctx);
+Reader _makeReadFile(NodeContext ctx, String digest);
+
+## Wrapper for the three disjoint elements of a node.  These can vary
+## independently.
+## - The NodeStore, which can vary if the FSInfo changes (we probably should
+##   have had FSInfo wrap the NodeStore).
+## - The Cache, which always stays the same.
+## - The Head, which can vary with different branches.
+##
+## Note that this is also a HashMapFieldSet, allowing external systems to
+## attach arbitrary data to it.
+class NodeContext : HashMapFieldSet {
+    NodeStore __store;
+    Cache __cache;
+    Head __head;
+
+    ## The current session.
+    Session __session;
+
+    ## The set of all session ids in the journal
+    HashMap[String, bool] __sessionIds = {};
+
+    ## This flag allows us to turn off journal writes when creating the
+    ## journal info file during a commit.
+    bool __journalEnabled = true;
+
+    void addChange(Change change);
+
+    ## The Orphan Context is a node context for portions of the filesystem
+    ## that have been "orphaned" - deleted from the filesystem, but with
+    ## references still held by external datastructures (e.g. open files in
+    ## FUSE).  It is different from a normal NodeContext in that it doesn't
+    ## record changes in the journal and doesn't ever trigger a commit.
+    ##
+    ## It's actually an instance of OrphanContext, but we haven't defined that
+    ## or its base class yet, and can't,
+    Object __orphanContext;
+
+    oper init(NodeContext other) :
+        __store = other.__store,
+        __cache = other.__cache,
+        __head = other.__head,
+        __session = other.__session {
+    }
+
+    ## Convenience constructor to create a context from an existing NodeStore
+    ## and Cache.  Note that you must call recordCommit() after creating an
+    ## instance with this constructor.
+    oper init(NodeStore store, Cache cache, String branch) :
+        __store = store,
+        __cache = cache,
+        __head = Head(branch, null),
+        __session = store.getSession(branch) {
+    }
+
+    ## Convenience constructor to create a NodeContext complete with a Cache
+    ## and Head object.  This is primarily useful for the unit tests.
+    oper init(NodeStore store, String branch, String baselineCommit) :
+        __store = store,
+        __cache = Cache(),
+        __head = Head(branch, baselineCommit),
+        __session = store.getSession(branch) {
+    }
+
+    void addChange(Change change) {
+        if (!__journalEnabled)
+            return;
+        if (__head.lastChange)
+            change.lastChange = __head.lastChange;
+        else
+            change.commit = __head.baselineCommit;
+        change.sessionId = __session.getId();
+        __sessionIds[__session.getId()] = true;
+        __head.lastChange = __store.writeToJournal(__head.branch, change);
+    }
+
+    ## Returns true if the caller should commit.
+    bool shouldCommit() {
+        return __journalEnabled &&
+               __store.getJournalSize(__head.branch) >= __cache.maxJournalSize;
+    }
+
+    @final String storeNode(Node node) {
+        return __store.storeNode(node);
+    }
+
+    ## Gets the node for the given digest, returns null if undefined.
+    @final Node getNode(String digest) {
+        node := __cache.getNode(digest);
+        if (!node) {
+            node = __store.getNode(digest);
+            if (node)
+                __cache.storeNode(digest, node.clone());
+        } else {
+            node = node.clone();
+        }
+        return node;
+    }
+
+    ## Get the specified commit from the node store.
+    @final Commit getCommit(String commitDigest) {
+        return __store.getCommit(commitDigest);
+    }
+
+    @final void clearJournal() {
+        __store.deleteJournal(__head.branch);
+        __sessionIds.clear();
+    }
+
+    @final uint getJournalSize(String branch) {
+        return __store.getJournalSize(branch)
+    }
+
+    @final JournalIter makeJournalIter() {
+        return __store.makeJournalIter(__head.branch);
+    }
+
+    ## Set the head of the current branch to the commit digest.
+    @final void setHead(String digest) {
+        __store.setHead(__head.branch, digest);
+    }
+
+    ## Set the branch of the node context.
+    ## I'm not sure that this is a very good idea.  It is only used when
+    ## creating a merge branch, where it is used to set an antire tree to the
+    ## new merge branch.  Since the current tree is disposable at this point,
+    ## this should be safe.  An alternate approach would be to copy the target
+    ## node into a new context created for the branch.
+    @final void setBranch(String branch) {
+        __head.branch = branch;
+    }
+
+    ## Remove the branch.
+    @final void removeBranch(String branch) {
+        __store.deleteHead(branch);
+        __store.deleteJournal(branch);
+    }
+
+    @final String makeDigest(Node node) { return __store.makeDigest(node) }
+
+    @final uint getMaxChildren() { return __cache.maxChildren }
+    @final void setMaxChildren(uint val) { __cache.maxChildren = val }
+
+    @final uint getMaxJournalSize() { return __cache.maxJournalSize }
+    @final void setMaxJournalSize(uint val) { __cache.maxJournalSize = val }
+
+    @final uint getMaxContentSize() { return __cache.maxContentSize }
+
+    @final uint getGCThreshold() { return __cache.gcThreshold }
+    @final void setGCThreshold(uint val) { __cache.gcThreshold = val }
+
+    @final uint getGCBottom() { return __cache.gcBottom }
+
+    @final Cache getCache() { return __cache }
+    @final NodeStore getStore() { return __store }
+
+    ## Records the digest of a new commit within the Head datastructure.
+    @final void recordCommit(String commit) {
+        __head.lastChange = null;
+        __head.baselineCommit = commit;
+    }
+
+    ## Run garbage collection.  'amount' is the number of bytes that we want
+    ## to release.
+    @final void garbageCollect() { __cache.garbageCollect() }
+
+    ## Call the "object create" handler.  This should be used when a CacheNode is
+    ## constructed.
+    @final void onObjCreate(Object obj) {
+        if (__cache.onObjCreate)
+            __cache.onObjCreate(obj);
+    }
+
+    ## Call the "Object destroy" handler.
+    @final void onObjDestroy(Object obj) {
+        if (__cache.onObjDestroy)
+            __cache.onObjDestroy(obj);
+    }
+
+    @final String getBaselineCommit() { return __head.baselineCommit }
+    @final String getLastChange() { return __head.lastChange }
+    @final void setLastChange(String digest) { __head.lastChange = digest }
+
+    ## Returns the branch name.
+    @final String getBranch() { return __head.branch }
+
+    ## Get the head revision of the current branch.
+    @final String getHead() {
+        # TODO: it looks like we can get into a situation where
+        # __head.baselineCommit is undefined but the branch head file _is_,
+        # which seems odd.  Figure out how best to improve upon this.
+        if (__head && __head.baselineCommit)
+            return __head.baselineCommit;
+        else
+            return __store.getHead(__head.branch)
+    }
+
+    ## Returns the "branch digest" - this is the digest of the last change if
+    ## there is one, otherwise it is the digest of the commit.
+    @final String getBranchDigest() {
+        return __head.lastChange ? __head.lastChange : __head.baselineCommit;
+    }
+
+    ## Stores a new commit and updates the branch head.
+    @final void storeCommit(Commit commit) {
+        __store.setHead(getBranch(), commitDigest := __store.storeCommit(commit));
+        recordCommit(commitDigest);
+        info I`commit: digest = $(altEncode(commitDigest)), \
+               new root = $(altEncode(commit.root))`;
+    }
+
+    ## Stores a new session id discovered while replaying the journal.
+    ## Note that this operation is idempotent.
+    @final void storeSessionId(String sessionId) {
+        __sessionIds[sessionId] = true;
+    }
+
+    ## Copy all session ids from the other context (used for merging a branch).
+    @final void copySessionIds(NodeContext other) {
+        for (item :in other.__sessionIds)
+            __sessionIds[item.key] = true;
+    }
+
+    ## Set the current session id (introduced to support unit tests).
+    @final void setSessionId(String sessionId) {
+        __session.setId(sessionId);
+    }
+
+    @final String makeJournalInfo() {
+        # The journal info file is just a list of serialized proto-strings
+        # containing the session ids.
+        @assert(__journalEnabled);
+        __journalEnabled = false;
+        out := _makeWriteFile(this);
+        for (item :in __sessionIds) {
+            sw := SerialWriter(out);
+            sw.write(item.key);
+        }
+        __journalEnabled = true;
+        return out.commit();
+    }
+
+    ## Returns the journal info (a set of session ids) for a given commit
+    ## digest.
+    @final HashMap[String, bool] getJournalInfo(String digest) {
+        sr := SerialReader(_makeReadFile(this, digest));
+        result := HashMap[String, bool]();
+        while (sessionId := sr.readString(false))
+            result[sessionId] = true;
+        return result;
+    }
+
+    ## Base class for OrphanContext.  This has to be an abstract base class
+    ## because we can't use CachedNode yet.
+    @abstract class _OrphanContextBase : NodeContext {
+        oper init(NodeContext other) :
+            NodeContext(other) {
+        }
+        @abstract void addOrphan(CachedNode node);
+    }
+
+    @final _OrphanContextBase getOrphanContext() {
+        if (!__orphanContext)
+            # Create an orphan context and root.
+            __orphanContext = _makeOrphanContext(this);
+        return _OrphanContextBase.cast(__orphanContext);
+    }
+}
+
+## Creates a CachedNode.
+CachedNode makeCachedNode(CachedNode parent, NodeContext ctx, String digest);
+
+## Wraps a Node object with caching functionality.
+class CachedNode {
+    NodeContext __ctx;
+
+    ## The node digest.  This is null for a "dirty" node -- a node that has
+    ## not yet been stored, or has been modified since it was loaded.
+    String digest;
+    Node node;
+
+    ## If true, the node has been orphaned (released while an external object
+    ## still holds a reference to it).
+    bool __orphaned;
+
+    ## The number of external references holding this node.
+    uint __extRefCount;
+
+    ## The parent node (the directory if this is a directory or top-level
+    ## file node, an intermediate node for anything else).  Note that this
+    ## introduces a reference cycle, so you need to call __release() on a node
+    ## to break this cycle (and also to remove the node from the LRU queue in
+    ## the cache).
+    CachedNode parent;
+
+    class VerifyReport;
+    VerifyReport verify();
+    VerifyReport verify(bool materializeAll);
+
+    ## Gets the node's mode.
+    @final int getMode() {
+        return node.mode;
+    }
+
+    @final bool isDir() {
+        return node.mode & MODE_DIR;
+    }
+
+    @final uint64 getSize();
+    @final bool __release(bool delete);
+
+    ## Manages caching for an Entry record and the associated child node.
+    ##
+    ## Invariants:
+    ## - 1:1 relationship between CachedEntry and its parent.  The parent must
+    ##   have the cached entry in its children list and the entry must only be
+    ##   in one parent's children list.  This must be enforced by CachedNode.
+    class CachedEntry {
+        Entry entry;
+        NodeContext __ctx;
+        CachedNode node;
+        CachedNode __parent;
+
+        oper init(NodeContext ctx, Entry entry, CachedNode parent) :
+            entry = entry,
+            __ctx = ctx,
+            __parent = parent {
+        }
+
+        oper init(Entry entry, CachedNode node, CachedNode parent) :
+            entry = entry,
+            node = node,
+            __parent = parent {
+
+            # We shouldn't really need the cache if we've already got the
+            # node, but this gives us a clean invariant.
+            __ctx = node.__ctx;
+        }
+
+        @final String getName() {
+            return entry.name;
+        }
+
+        @final String getDigest() {
+            return entry.hash;
+        }
+
+        @final void setDigest(String digest) {
+            entry.hash = digest;
+        }
+
+        @final uint64 getSize() {
+            return uint64(entry.size);
+        }
+
+        ## Returns the node referenced by this child object.
+        @final CachedNode getNode() {
+            # Lazy load the node.
+            if (!node) {
+                if (!entry.hash)
+                    throw InvalidStateError(
+                        FStr() `No hash or node for $(entry.name)`
+                    );
+                node = makeCachedNode(__parent, __ctx, entry.hash);
+            }
+            return node;
+        }
+
+        @final int getMode() {
+            return getNode().getMode();
+        }
+
+        @final CachedNode getParent() { return __parent }
+        @final void setParent(CachedNode parent) {
+            __parent = parent;
+            if (node)
+                node.parent = parent;
+        }
+
+        @final void setCachedNode(CachedNode node) {
+            this.node = node;
+            entry.size = node.getSize();
+            entry.hash = null;
+        }
+
+        ## Set the size in the entry to the size of the referenced node.
+        @final void fixSize() {
+            entry.size = getNode().getSize();
+        }
+
+        ## Release the node (if any) allowing it to be GCed.
+        ## Returns true if the node was actually released (or wasn't there in
+        ## the first place).
+        @final bool releaseNode(bool delete) {
+            if (!node)
+                return true;
+
+            if (node.__release(delete)) {
+                node = null;
+                return true;
+            }
+
+            return false;
+        }
+
+        @final bool releaseNode() { return releaseNode(true) }
+
+        void formatTo(Formatter out) {
+            indent := Indenter.wrap(out);
+            dig := getDigest();
+            String digest;
+            if (dig)
+                digest := altEncode(dig);
+            name := getName();
+            if (name is null)
+                out `-   `;
+            else
+                out I`$(name.getRepr()):\n`;
+            ++indent;
+            out I`digest: $(sig(digest))
+                  size: $(getSize())
+                  node: `;
+            out `$(node)\n`;
+            --indent;
+        }
+    }
+
+    ## A list of children sorted by name.  Retrieval/insertion by name is
+    ## supported.
+    ## node.children must exist for this to be created.
+    class __ChildArray {
+
+        # Underlying representation (stored in the Node).
+        Array[Entry] __rep;
+
+        # Cached entries.
+        Array[CachedEntry] __cached;
+
+        oper init(Array[Entry] rep) :
+            __rep = rep,
+            __cached(rep.count(), null) {
+        }
+
+        ## Recursive helper for __findIndex(String).
+        @final int __findIndex(String name, uint start, uint end) {
+
+            if (!__cached.count())
+                return -1;
+
+            uint midpoint = (end - start) / 2 + start;
+            if (midpoint == start) {
+                comparison := cmp(name, __cached[midpoint].getName());
+                if (comparison == 0)
+                    return start;
+                else if (comparison < 0)
+                    return -(start + 1);
+                else
+                    return -(end + 1);
+            }
+
+            if (name == __cached[midpoint].getName())
+                return midpoint;
+
+            if (name < __cached[midpoint].getName())
+                return __findIndex(name, start, midpoint);
+            else
+                return __findIndex(name, midpoint, end);
+        }
+
+        ## Find the index of the child with the given name.  If there is no
+        ## match in the array, returns the
+        ## negative index + 1 of where the element would be (so if it belonged
+        ## at index 0, we would return -1).  Returns the index of the element
+        ## if it was found as an ordinary positive integer.
+        @final int findIndex(String name) {
+            return __findIndex(name, 0, __cached.count());
+        }
+
+        ## Return the entry identified by the name, null if it doesn't exist.
+        @final CachedEntry get(String name) {
+            i := __findIndex(name, 0, __cached.count());
+            if (i < 0)
+                return null;
+            else
+                return __cached[i];
+        }
+
+        ## Adds a child to the array by order of name.  Returns the size of
+        ## the original entry, if any.
+        @final uint64 add(CachedEntry entry) {
+            i := findIndex(entry.getName());
+            if (i >= 0) {
+                orgSize := __cached[i].getSize();
+                __cached[i] = entry;
+                __rep[i] = entry.entry;
+                return orgSize;
+            } else {
+                __cached.insert(-i - 1, entry);
+                __rep.insert(-i - 1, entry.entry);
+                return 0;
+            }
+        }
+
+        @final CachedEntry delete(String name) {
+            i := findIndex(name);
+            if (i >= 0) {
+                result := __cached[i];
+                __cached.delete(i);
+                __rep.delete(i);
+                return result;
+            } else {
+                return null;
+            }
+        }
+
+        ## Deletes a child by index.
+        @final void delete(uint index) {
+            __cached.delete(index);
+            __rep.delete(index);
+        }
+
+        @final void append(CachedEntry entry) {
+            __cached.append(entry);
+            __rep.append(entry.entry);
+        }
+
+        @final void insert(uint index, CachedEntry entry) {
+            __cached.insert(index, entry);
+            __rep.insert(index, entry.entry);
+        }
+
+        @final uint count() {
+            return __cached.count();
+        }
+
+        @final CachedEntry oper [](int index) {
+            return __cached[index];
+        }
+
+        @final CachedEntry oper []=(int index, CachedEntry entry) {
+            return __cached[index] = entry;
+        }
+
+        @final Array[CachedEntry].ArrayIter iter() { return __cached.iter() }
+
+        ## Returns the underlying array of entries.  Caller must not modify
+        ## its contents directly.
+        @final Array[Entry] getRep() { return __rep }
+
+        void formatTo(Formatter out) {
+            out `CachedEntries![\n`;
+            for (child :in __cached)
+                out `$child\n`;
+            out `]`;
+        }
+
+        bool isTrue() { return __cached }
+    }
+
+    # A sparse-array version of Node.children.  These get filled in as they
+    # are accessed or when __populateChildren() is called.
+    __ChildArray __children;
+
+    ## digest should be null for a new node.
+    oper init(NodeContext ctx, String digest, Node node) :
+        __ctx = ctx,
+        digest = digest,
+        node = node {
+
+        __ctx.onObjCreate(this);
+    }
+
+    oper del() {
+        __ctx.onObjDestroy(this);
+    }
+
+    ## Returns true if the node is dirty (hasn't been stored or has been
+    ## modified since being stored).
+    @final bool isDirty() { return !digest }
+
+    ## Allocate __children array to mirror the values in node.children.
+    ## Creates node.children if it doesn't exist.
+    @final void __makeChildren() {
+        # First make sure we have node.children.
+        if (!node.children)
+            node.children = Array[Entry]();
+
+        # Create an array of children to mirror that of node.children,
+        # initialize all elements to null.
+        __children = __ChildArray(node.children);
+    }
+
+    ## Returns true if the object is disposable, meaning that it doesn't need
+    ## to be memory resident.  A CachedNode is disposable if it is not dirty
+    ## and has no children.
+    bool disposable() {
+        if (isDirty()) {
+            return false;
+        }
+
+        # Non-dirty node without children is disposable.
+        if (!__children)
+            return true;
+
+        for (child :in __children) {
+            if (child.node) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    ## Release the cached node from its parent and from all children.
+    ## Returns true if the node was actually released.
+    @final bool __release(bool delete) {
+        # If there are external references, add the node to an orphan context.
+        if (delete && __extRefCount) {
+            __orphaned = true;
+            __ctx = ctx := __ctx.getOrphanContext();
+            ctx.addOrphan(this);
+            return false;
+        }
+
+        if (__children) {
+            # Releasing the children breaks all cyclic links to the parent.
+            allDeleted := true;
+            for (child :in __children) {
+                if (!child.releaseNode(delete))
+                    allDeleted = false;
+            }
+            if (allDeleted)
+                __children = null;
+        }
+
+        # If there are external references, quit here (we don't want to remove
+        # ourselves from the tree because we could end up needing to mark our
+        # ancestors as dirty if the node is modified).
+        if (__extRefCount)
+            return false;
+
+        # Find the entry that holds the node in the parent (if any).
+        if (parent && parent.__children) {
+            for (child :in parent.__children) {
+                if (child.node is this) {
+                    child.node = null;
+                    break;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    ## Add an external reference to the node.  External systems that may
+    ## continue to modify the node should call this to ensure that the node
+    ## does not get released if it is deleted without notice.
+    ##
+    ## Returns the node itself.
+    @final CachedNode addExtRef() {
+        ++__extRefCount;
+        return this;
+    }
+
+    ## Release an external reference claimed with addExtRef().
+    @final void releaseExtRef() {
+        if (__orphaned && !--__extRefCount)
+            __release(false);
+    }
+
+    ## Returns the "resident size" of the node.  This is an approximation of
+    ## the memory size of the node and all of its descendents that are loaded
+    ## into memory.
+    uintz getRSize() {
+        # TODO: Implement sizeof in crack, convert to real sizeof.  This sucks.
+        class End : VTableBase {}
+        class Sizer : CachedNode, End {
+            oper init() : CachedNode(null, null, null) {}
+        }
+        class StringSizer : String, End {}
+        class ChildArraySizer : __ChildArray, End {
+            oper init() : __ChildArray(null) {}
+        }
+        class EntryArraySizer : Array[Entry], End {}
+        class Ptr { voidptr p; }
+        class PtrSizer : Ptr, End {}
+        class CachedEntrySizer : CachedEntry, End {
+            oper init() : CachedEntry(null, null, null) {}
+        }
+        uintz sizeof(End end) { return uintz(end) }
+        stringSize := sizeof(StringSizer.unsafeCast(null));
+        ptrSize := sizeof(PtrSizer.unsafeCast(null));
+        sz := sizeof(Sizer.unsafeCast(null));
+        if (digest)
+            sz += stringSize + digest.size;
+
+        sz += _getNodeSize(node);
+
+        if (!(__children is null)) {
+            sz += sizeof(ChildArraySizer.unsafeCast(null));
+            sz += ptrSize * __children.count();
+            for (child :in __children) {
+                if (child) {
+                    sz += sizeof(CachedEntrySizer.unsafeCast(null)) *
+                          __children.count();
+                    if (child.node)
+                        sz += child.node.getRSize();
+                }
+            }
+        }
+
+        return sz;
+    }
+
+    ## Allocate the __children scaffold and populate with the child entries
+    ## from the node.
+    ## If createEmpty is true, create the scaffold even if node.children is
+    ## null, and also create an empty node.children.
+    ## If createEmpty is false and children is null or empty, do nothing and
+    ## return false.
+    ## Return true if the scaffold exists at the end of the method, false if
+    ## not.
+    @final bool __populateChildren(bool createEmpty) {
+        if (!(__children is null))
+            return true;
+        if (node.children || createEmpty) {
+            if (node.children is null)
+                node.children = Array[Entry]();
+            __makeChildren();
+            for (iter :on node.children)
+                __children[iter.index] =
+                    CachedEntry(__ctx, iter.elem(), this);
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    CachedEntry __getChildEntry(uint index) {
+        CachedEntry cachedEntry;
+        if (!__populateChildren(false))
+            return null;
+
+        cachedEntry = __children[index];
+        if (!cachedEntry) {
+            entry := node.children[index];
+
+            node := makeCachedNode(this, __ctx, entry.hash);
+            if (!node) {
+                error `Unable to load node $(entry.hash)`;
+                return null;
+            }
+
+            cachedEntry = __children[index] = CachedEntry(entry, node, this);
+        }
+
+        return cachedEntry;
+    }
+
+    ## Get a child by its index.  Throw IndexError if the index is out of
+    ## range.  Return null if we are unable to retrieve the node.
+    CachedNode getChild(uint index) {
+        cachedEntry := __getChildEntry(index);
+        return cachedEntry.getNode();
+    }
+
+    ## Returns the name of a child.
+    String getChildName(uint index) {
+        cachedEntry := __getChildEntry(index);
+        return cachedEntry.getName();
+    }
+
+    ## Get the child with the given name.  Returns null if there is no such
+    ## child.
+    @final CachedNode getChild(String name) {
+        if (!__populateChildren(false))
+            return null;
+        child := __children.get(name);
+        if (!child)
+            return null;
+        else
+            return child.getNode();
+    }
+
+
+    ## Returns the total size of the node.
+    @final uint64 getSize() {
+        return node.size;
+    }
+
+    @final String getContents() {
+        if (!(node.contents is null)) {
+            return node.contents;
+        } else if (node.children != null) {
+            AppendBuffer buf = {getSize()};
+            __populateChildren(false);
+            for (child :in __children)
+                buf.extend(child.getNode().getContents());
+            return String(buf, true);
+        } else {
+            return null;
+        }
+
+    }
+
+    ## Returns all ccontent leaf nodes of a given node.  This method is really
+    ## just for testing/debugging purposes.
+    @final StringArray getChunks() {
+        if (!(node.contents is null))
+            return StringArray![node.contents];
+
+        @assert(__populateChildren(true));
+        StringArray result = {};
+        for (child :in __children)
+            result.extend(child.getNode().getChunks());
+        return result;
+    }
+
+    ## Returns true if this is a content node (a leaf).
+    @final bool __isContentNode() { return node.contents }
+
+    ## Returns the CachedEntry for the child wrapping the node.  Returns
+    ## 'null' if undefined.
+    ## __populateChildren() must have been called before this.
+    @final CachedEntry __getChildEntry(CachedNode node) {
+        for (child :in __children) {
+            if (child.node is node)
+                return child;
+        }
+
+        return null;
+    }
+
+    ## Mark the node as dirty and do the same for all parent nodes.
+    void __markDirty() {
+        # Find the child in the parent and invalidate all instances.
+        if (parent) {
+            myEntry := parent.__getChildEntry(this);
+            myEntry.setDigest(null);
+
+            # If size has changed, change it in the parent.
+            if (myEntry.getSize() != getSize()) {
+                diff := getSize() - myEntry.getSize();
+                myEntry.entry.size += diff;
+                parent.node.size += diff;
+            }
+        }
+
+        digest = null;
+        if (parent) parent.__markDirty();
+    }
+
+    void __makePath(Array[int32] path) {
+        if (!parent)
+            return;
+
+        # Lookup the index of the child (it is always safe to assume
+        # __children has been populated for a parent).
+        uint i = 0;
+        for (child :in parent.__children) {
+
+            # We use .node here instead of getNode(), if the node hasn't been
+            # lazy loaded it can't be this one, and we don't want to lazy load
+            # any new nodes.
+            if (child.node is this)
+                break;
+            ++i;
+        }
+
+        parent.__makePath(path);
+        path.append(int32(i));
+    }
+
+    CachedNode getRoot();
+    String commit();
+    void garbageCollect();
+
+    ## Commit the entire tree and record a commit object.
+    ## altDigest: nullable, if present this is the digest of a commit of an
+    ## alternate branch that is being merged.
+    ## metadata: nullable, if present contains user-supplied metadata.
+    void commitTree(String altDigest, CommitMetadata metadata) {
+        info `committing on branch $(__ctx.getBranch()).`;
+        newRootDigest := getRoot().commit();
+        Commit commit = {};
+        commit.root = newRootDigest;
+        commit.timestamp = Time.now().secs;
+        commit.metadata = metadata;
+
+        # Add the parent commits.
+        if (head := __ctx.getHead())
+            commit.parent_append(__ctx.getHead());
+        if (altDigest)
+            commit.parent_append(altDigest);
+
+        commit.journalInfo = __ctx.makeJournalInfo();
+        __ctx.storeCommit(commit);
+        __ctx.clearJournal();
+        size := getSize();
+
+        # After commit is the best time to run garbage collection because
+        # there are no dirty nodes.
+        garbageCollect();
+    }
+
+    ## Commit the entire tree and record a commit object.
+    void commitTree() { commitTree(null, null) }
+
+    ## Record a change in the journal for this node or for the appropriate
+    ## parent node if this node doesn't have a digest yet.
+    ##
+    ## Returns true if we committed in the course of this.
+    bool __recordChange(Change change) {
+        change.path = Array[int32]();
+        __makePath(change.path);
+        __ctx.addChange(change);
+        if (__ctx.shouldCommit()) {
+            commitTree();
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    ## Internal add child method, which does everything but create a change
+    ## record.
+    CachedNode __addChild(String name, CachedNode child, int32 time) {
+        child.parent = this;
+
+        CachedEntry entry = {Entry(), child, this};
+        entry.entry.name = name;
+
+        __populateChildren(true);
+
+        # Add the child.
+        orgSize := __children.add(entry);
+        node.size += (entry.entry.size = child.getSize()) - orgSize;
+        if (time)
+            node.time = time;
+
+        # Mark the node and the entire ancestor chain as dirty.
+        __markDirty();
+
+        return child;
+    }
+
+    ## Record all children as "replace child" changes to reconstruct an added
+    ## node in the journal
+    ##
+    ## Returns true if this resulted in a commit.
+    @final bool __deepRecord() {
+        if (!isDirty())
+            # We should never actually do this because we're checking for a
+            # null node in the layer above.
+            return false;
+
+        if (__populateChildren(false)) {
+            for (childIter :on __children) {
+                child := childIter.elem();
+                if (!child.node)
+                    continue;
+
+                change := Change();
+                change.node = child.node.node;
+                @assert(change.node);
+
+                # Record the change to the child.  Since this is called from
+                # immediately after storing a parent with a broken slot for
+                # this child, we always want to simply do a replace_child,
+                # which will just change the value of the slot.
+                change.type = CHANGE_REPLACE_CHILD;
+                @assert(change.node || change.digest);
+                change.index = int32(childIter.index);
+                if (__recordChange(change))
+                    return true;
+            }
+
+            # Do a "deep record" on each of the dirty children.  This has to
+            # happen _after_ the child nodes themselves are recorded.
+            for (child :in __children) {
+                if (child.node && child.node.__deepRecord())
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    ## Add a new child which is a CachedNode.
+    ## You should use this for adding children with cached descendants.
+    void addChild(String name, CachedNode child, int32 time) {
+        # If the child is dirty and has children, we have to go through and
+        # replay each of the dirty children against the journal (this can
+        # happen if a node is copied from another context).
+        bool needsChildRecord =
+            child.isDirty() && child.__populateChildren(false);
+
+        __addChild(name, child, time);
+
+        # Record the change in the journal.
+        change := Change();
+        change.type = CHANGE_ADD_CHILD;
+        change.name = name;
+        change.node = child.node;
+        change.time = time;
+        __recordChange(change);
+
+        # Record the children against the journal.
+        if (needsChildRecord)
+            child.__deepRecord();
+    }
+
+    ## Add a new child node with the specified name.
+    CachedNode addChild(String name, Node node, int32 time) {
+        addChild(name, child := CachedNode(__ctx, null, node), time);
+        return child;
+    }
+
+    ## Delete the named child and return true, or return false if the child
+    ## doesn't exist.
+    bool deleteChild(String name, int32 time) {
+        if (!__populateChildren(false))
+            return false;
+        child := __children.delete(name);
+        if (!child)
+            return false;
+        node.size -= child.getSize();
+        if (time)
+            node.time = time;
+        child.releaseNode();
+
+        # Record the change.
+        change := Change();
+        change.type = CHANGE_DELETE_CHILD;
+        change.name = name;
+        change.time = time;
+        __recordChange(change);
+        __markDirty();
+
+        return true;
+    }
+
+    ## Returns the number of children in the node.
+    uint getChildCount() {
+        return node.children ? node.children.count() : 0;
+    }
+
+    ## Returns the root of the cached filesystem.
+    CachedNode getRoot() {
+        if (!parent)
+            return this;
+        else
+            return parent.getRoot();
+    }
+
+    ## Returns the node context object for the node.
+    NodeContext getContext() {
+        return __ctx;
+    }
+
+    ## Make a new unnamed entry for the node parented by 'this'.
+    CachedEntry __makeUnnamedEntry(CachedNode node, CachedNode parent) {
+        entry := Entry();
+        entry.size = node.getSize();
+        cachedEntry := CachedEntry(__ctx, entry, this);
+        cachedEntry.node = node;
+        cachedEntry.setParent(parent);
+        return cachedEntry;
+    }
+
+    ## Split the node if it exceeds the maximum number of children.  If the
+    ## node is split, return the new node full of the higher children.
+    ## Otherwise return null.
+    CachedNode __maybeSplit() {
+        if (__children.count() <= __ctx.getMaxChildren())
+            return null;
+
+        # Number of nodes in the new first child.
+        newSize := __children.count() / 2;
+
+        # Make a copy of the children and reset.
+        children := __children;
+        __children = null;
+        node.children = null;
+        node.size = 0;
+        __populateChildren(true);
+
+        # Copy the lower children to the receiver.
+        int i;
+        for (; i < newSize; ++i) {
+            __children.append(children[i]);
+            node.size += children[i].getSize();
+        }
+
+        # Create a new node and copy the higher children.
+        CachedNode newNode = {__ctx, null, Node()};
+        newNode.__populateChildren(true);
+        for (; i < children.count(); ++i) {
+            newNode.__children.append(child := children[i]);
+            child.setParent(newNode);
+            newNode.node.size += children[i].getSize();
+        }
+
+        return newNode;
+    }
+
+    ## Append a new child to the end of the tree.  If the insertion of the
+    ## child results in an intermediate node being split, return the new
+    ## intermediate node.  Otherwise return null.
+    ## 'child' must be a content node.
+    CachedNode __appendChild(CachedNode child) {
+        # XXX why does this not mark the node as dirty?
+        if (!__populateChildren(false)) {
+            # Content node.  Just return the new child as the extra node,
+            # parent will append.
+            return child;
+        } else if (!__children ||
+                   __children[0].getNode().node.children is null) {
+            # The children of this node are content nodes, append here.
+            # (we do the check for !__children because it's possible to end up
+            # in an intermediate state with no children.  grrrr... broken
+            # invariants)
+            __children.append(ent := __makeUnnamedEntry(child, this));
+            node.size += ent.getSize();
+            @assert(ent.getParent() is this);
+            return __maybeSplit();
+        } else {
+            node.size += child.node.size;
+
+            # Recurse to last child, update the size in the entry.
+            lastChild := __children[-1];
+            extra := lastChild.getNode().__appendChild(child);
+            if (extra) {
+                lastChild.fixSize();
+                __children.append(ent := __makeUnnamedEntry(extra, this));
+                @assert(ent.getParent() is this);
+                return __maybeSplit();
+            } else {
+                # If we added to the last child without a split, we need to
+                # update the entry's size.
+                lastChild.entry.size += child.node.size;
+            }
+        }
+
+        return null;
+    }
+
+    ## Reset the node object associated with the cached node and also reset
+    ## all fields dependent on the node and mark the cached node as dirty.
+    void __resetNode(Node node) {
+        this.node = node;
+        __children = null;
+        digest = null;
+    }
+
+    Node __makeNode(String contents) {
+        newNode := Node();
+        newNode.contents = contents;
+        newNode.size = contents.size;
+        return newNode;
+    }
+
+    ## Steal and reparent the child array from 'other'.
+    void __stealChildren(CachedNode other) {
+        # XXX why does this not mark the node as dirty?
+        # Don't modify other.node - in some cases we steal the entire node as
+        # well as its children.
+        __children = other.__children;
+        node.children = other.__children.getRep();
+        node.size = other.node.size;
+        for (child :in __children)
+            child.setParent(this);
+        other.__children = null;
+    }
+
+    ## Add a new tier to a top-level node by creating a new child node and
+    ## moving all of the children to it.
+    void __addTier() {
+        @assert(__populateChildren(false));
+
+        # Create a new node to hold the existing children.
+        firstChild := CachedNode(__ctx, null, Node());
+        firstChild.__stealChildren(this);
+
+        # Create a new node with a child array.
+        __resetNode(Node());
+        __populateChildren(true);
+
+        __children.append(ent := __makeUnnamedEntry(firstChild, this));
+        node.size += ent.getSize();
+        firstChild.parent = this;
+    }
+
+    ## Append a new content string to the end of the tree.
+    ## This is only public for tests.  It doesn't write a journal entry, use
+    ## write() instead.
+    void append(String contents) {
+        newNode := __makeNode(contents);
+        cached := CachedNode(__ctx, null, newNode);
+        extra := __appendChild(cached);
+        if (extra) {
+            # If this is a content node, we need to convert it to an
+            # intermediate node.
+            if (node.children is null) {
+                CachedNode firstChild;
+                if (node.contents != null)
+                    firstChild = CachedNode(__ctx, null, node);
+
+                # Create a new node with a child array.
+                __resetNode(Node());
+                __populateChildren(true);
+
+                if (firstChild) {
+                    __children.append(ent := __makeUnnamedEntry(firstChild,
+                                                                this));
+                    node.size += ent.getSize();
+                }
+            } else {
+                # The current node is the top-level intermediate node and it
+                # has been split.
+                __addTier();
+            }
+            __children.append(ent := __makeUnnamedEntry(extra, this));
+            node.size += ent.getSize();
+            __markDirty();
+            # XXX we need to "maybeSplit" after this and then do the same
+            # switch we did above.
+        }
+    }
+
+    ## Write the beginning of the chunk containing 'pos' up to 'pos'.
+    ## Returns the
+    uint64 __writeChunkPrefix(Writer out, uint64 pos) {
+        # If we've got contents, write the beginning of the contents.
+        if (node.contents) {
+            out.write(Buffer(node.contents.buffer, uintz(pos)));
+            return 0;
+        }
+
+        # Otherwise find the child containing the position.
+        uint64 base;
+        __populateChildren(false);
+        for (child :in __children) {
+            if (pos < base + child.getSize()) {
+                return base +
+                       child.getNode().__writeChunkPrefix(out, pos - base);
+            }
+
+            base += child.getSize();
+        }
+
+        # We shouldn't get here, the position begins after all children.
+        return base;
+    }
+
+    ## Write the end of the chunk containing pos (from pos to the end of the
+    ## chunk).
+    ## Returns the position of the end of the chunk.  If the return value is
+    ## greater than the size of the chunk, the caller must also write the next
+    ## child.
+    uint64 __writeChunkSuffix(Writer out, uint64 pos) {
+        # If the specified position is out of range, there's nothing to write.
+        if (pos >= node.size)
+            return node.size;
+
+        if (node.contents) {
+            out.write(Buffer(node.contents.buffer + pos,
+                             node.contents.size - pos
+                             )
+                      );
+            # If we're going to overwrite the chunking window, we need to
+            # return a signal to write the next chunk.
+            if (node.contents.size - pos < DEFAULT_WINDOW_SIZE) {
+                return node.contents.size + 1;
+            }
+            return node.contents.size;
+        }
+
+        uint64 base, continueToNext;
+        __populateChildren(false);
+        for (child :in __children) {
+            childSize := child.getSize();
+            if (pos < base + childSize) {
+                end := child.getNode().__writeChunkSuffix(out, pos - base);
+                if (end <= childSize)
+                    return base + end;
+
+                # The end exceeds the size of the child - continue to the next
+                # child.
+                pos = base + childSize;
+                continueToNext = 1;
+            }
+            base += childSize;
+        }
+
+        # We can get here if 'pos' is greater than the child -- or if we need
+        # to also add the next child because we may have changed the
+        # fingerprint.
+        return base + continueToNext;
+    }
+
+    ## Returns the children array, throwing an AssertionError if this is not
+    ## an inner node.
+    @final __ChildArray __getChildren() {
+        @assert(__populateChildren(false));
+        return __children;
+    }
+
+    ## Merge the child at the specified index with its nearest sibling.  The
+    ## child must have exactly one child of its own which will be inserted or
+    ## appended into the next or previous sibling.
+    ##
+    ## Returns true if we merged with the next child, false if we merged with
+    ## the previous child.
+    ##
+    ## This is only public for tests.
+    @final bool mergeChild(uint index) {
+        bool mergeWithNext;
+        node := __children[index].getNode();
+        @assert(node.getChildCount() == 1);
+        entry := node.__children[0];
+
+        if (index == 0 ||
+            index < __children.count() - 1 &&
+             __children[index + 1].getNode().getChildCount() <
+             __children[index - 1].getNode().getChildCount()
+            ) {
+            # Merge with the next child.
+
+            nextChildEntry := __children[index + 1];
+            nextChild := nextChildEntry.getNode();
+            nextChild.__getChildren().insert(0, entry);
+            nextChild.node.size += entry.getSize();
+            nextChildEntry.fixSize();
+
+            # Reparent the entry and remove it from its parent (we we can just
+            # set __children to null since its an only child).
+            entry.setParent(nextChild);
+            node.__children = null;
+
+            # Remove the child.
+            __children.delete(index);
+
+            # If the entry itself only has one child, merge recursively.
+            if ((n := entry.getNode()).__populateChildren(false) &&
+                 n.__getChildren().count() == 1
+                )
+                nextChild.mergeChild(0);
+
+            # Release the node now that we're done with it.
+            node.__release(true);
+
+            # Split the new entry.
+            newChild := nextChild.__maybeSplit();
+            if (newChild) {
+                nextChildEntry.fixSize();
+                __children.insert(index + 1,
+                                  __makeUnnamedEntry(newChild, this)
+                                  );
+            }
+
+            return true;
+        } else {
+            # Merge with the previous child.
+
+            prevChildEntry := __children[index - 1];
+            prevChild := prevChildEntry.getNode();
+            prevChild.__getChildren().append(entry);
+            prevChild.node.size += entry.getSize();
+            prevChildEntry.fixSize();
+
+            # Reparent the entry and remove it from its parent (we we can just
+            # set __children to null since its an only child).
+            entry.setParent(prevChild);
+            node.__children = null;
+
+            # Remove the child.
+            __children.delete(index);
+
+            # If the entry itself only has one child, merge recursively.
+            if ((n := entry.getNode()).__populateChildren(false) &&
+                 n.__getChildren().count() == 1
+                )
+                prevChild.mergeChild(prevChild.__getChildren().count() - 1);
+
+            # Release the node now that we're done with it.
+            node.__release(true);
+
+            # Split the new entry.
+            newChild := prevChild.__maybeSplit();
+            if (newChild) {
+                prevChildEntry.fixSize();
+                __children.insert(index,
+                                  __makeUnnamedEntry(newChild, this)
+                                  );
+            }
+
+            return false;
+        }
+    }
+
+    ## Returns the size of the child deleted, returns the negative size if the
+    ## child is an intermediate node with only one child of its own after the
+    ## delete.
+    int64 __deleteNode(uint64 pos) {
+        @assert(__populateChildren(false));
+        uint index;
+        for (child :in __children) {
+            int64 childSize;
+            if (pos < child.getSize()) {
+                # Delete this node or one of its children.
+                if (child.getNode().__isContentNode()) {
+                    # The child is a content node.  Remove it.
+                    childSize = int64(child.getSize());
+                    __children.delete(index);
+                    child.node.__release(true);
+                } else {
+                    # The child is an intermediate node, have it remove the
+                    # appropriate content node.
+                    childSize = child.getNode().__deleteNode(pos);
+                    if (childSize < 0) {
+                        # The child now has only one child of its own.
+                        mergeChild(index);
+                        childSize = -childSize;
+                    }
+
+                    child.entry.size -= uint64(childSize);
+                }
+
+                node.size -= uint64(childSize);
+                return (__children.count() < 2) ? -childSize : childSize;
+            }
+
+            pos -= child.getSize();
+            ++index;
+        }
+
+        # If we get here, the caller has specified a position that is out of
+        # bounds.
+        @assert(false);
+        return 0;
+    }
+
+    ## Delete the leaf node at the position.  Call this on the top-level node
+    ## of a file.
+    ## Returns the size of the deleted node.
+    ##
+    ## Public only for testing.
+    int64 deleteNode(uint64 pos) {
+        size := __deleteNode(pos);
+
+        # If we have one child left, collapse the level.  We don't need to
+        # call __populateChildren, __deleteNode() should have done that for us.
+        if (__children.count() == 1) {
+            cachedNode := __children[0].getNode();
+            node = cachedNode.node;
+            __stealChildren(cachedNode);
+            cachedNode.__release(true);
+            if (parent) {
+                entry := parent.__getChildEntry(this);
+                entry.setCachedNode(this);
+            }
+        }
+
+        __markDirty();
+        return size;
+    }
+
+    ## Delete a span from the tree.  Returns true of the node now has a single
+    ## child and should be merged.
+    bool __deleteSpan(uint64 start, uint64 end) {
+        if (node.contents) {
+            if (start > node.contents.size) {
+                return false;
+            } else if (start < node.contents.size && end < node.contents.size) {
+                node.contents = node.contents.substr(0, start) +
+                                node.contents.substr(end);
+            } else {
+                # Delete everything after start.
+                node.contents = node.contents.substr(0, start);
+            }
+            node.size = node.contents.size;
+            digest = null;
+            return false;
+        }
+
+        # This is an inner node.
+        @assert(__populateChildren(false));
+        for (int i; i < __children.count() && end; ++i) {
+            child := __children[i];
+            childSize := child.getSize();
+
+            if (start == 0 && end >= childSize) {
+                # The entire child node must be deleted.
+                __children.delete(i);
+                node.size -= childSize;
+                digest = null;
+                --i;
+                end -= childSize;
+                child.releaseNode();
+            } else if (start < childSize) {
+                # Part of the child must be deleted.
+                mustMerge := child.getNode().__deleteSpan(start, end);
+                child.fixSize();
+                amtDeleted := childSize - child.getSize();
+                node.size -= amtDeleted;
+                digest = null;
+                spanSize := end - start;
+                start = 0;
+
+                adjustedSpan := false;
+
+                # Before merging we have to verify that we have more than one
+                # child because this algorithm can leave us with just one
+                # remaining child.  We account for this in the merge - if
+                # we're merging a child that has only one child we recursively
+                # merge it.
+                if (mustMerge && __children.count() > 1) {
+                    if (mergeChild(i)) {
+                        # We merged with the _next_ child, so we have to adjust
+                        # the span.
+                        start = child.getSize();
+                        end = start + spanSize - amtDeleted;
+                        adjustedSpan = true;
+                    }
+                    --i;
+                }
+
+                if (!adjustedSpan) {
+                    # No merge or merged with previous.  Adjust the start and
+                    # end for the next child.
+                    start = 0;
+                    if (end < childSize)
+                        break;
+                    else
+                        end -= childSize
+                }
+            } else {
+                start -= childSize;
+                end -= childSize;
+            }
+        }
+
+        return __children.count() == 1;
+    }
+
+    ## Delete a range of bytes from the file.  This should only be applied to
+    ## the toplevel node of a file.
+    void deleteSpan(uint64 start, uint64 end, int32 time) {
+        if (__deleteSpan(start, end)) {
+            # We need to collapse a level.
+            firstChild := __children[0].getNode();
+            if (firstChild.node.contents) {
+                # The child is a content node, steal its contents.
+                node.contents = firstChild.node.contents;
+                node.size = node.contents.size;
+                __children = null;
+                node.children = null;
+            } else {
+                __stealChildren(firstChild);
+            }
+
+            firstChild.__release(true);
+        }
+
+        if (time)
+            node.time = time;
+        __markDirty();
+    }
+
+    CachedNode __insertChild(uint64 pos, CachedNode node) {
+        # This only works on inner nodes.
+        @assert(__populateChildren(false));
+        @assert(pos <= this.node.size);
+        int i;
+
+        digest = null;
+
+        if (!__children) {
+            # Deal with the case of an empty node. This can currently happen
+            # only in the case where the entire contents of a toplevel node
+            # are being replaced.  XXX I don't think this can happen in this
+            # case, even.
+            __children.append(__makeUnnamedEntry(node, this));
+        } else if (__children[0].getNode().__isContentNode()) {
+            # The children are content nodes, directly insert.
+
+            # Shortcut if we're inserting at the end.
+            if (pos == this.node.size) {
+                __children.append(__makeUnnamedEntry(node, this));
+            } else {
+                # Find the child to insert after.
+                for (child :in __children) {
+                    if (!pos) {
+                        __children.insert(i, __makeUnnamedEntry(node, this));
+                        break;
+                    } else {
+                        @assert(pos >= child.getSize());
+                    }
+
+                    pos -= child.getSize();
+                    ++i;
+                }
+            }
+        } else {
+            # Inner node, recurse.
+
+            # See if we're inserting at the end.
+            if (pos == this.node.size) {
+                child := __children[-1];
+                extra := child.getNode().__insertChild(child.getSize(), node);
+                child.fixSize();
+                if (extra)
+                    __children.append(__makeUnnamedEntry(extra, this));
+            } else {
+                int i = 1;
+                for (child :in __children) {
+                    if (pos < child.getSize()) {
+                        extra := child.getNode().__insertChild(pos, node);
+                        child.fixSize();
+                        if (extra) {
+                            __children.insert(i, __makeUnnamedEntry(extra, this));
+                        }
+                        break;
+                    }
+
+                    pos -= child.getSize();
+                    ++i;
+                }
+            }
+        }
+
+        this.node.size += node.getSize();
+        return __maybeSplit();
+    }
+
+    void __insert(uint64 pos, String contents) {
+        newNode := CachedNode(__ctx, null, __makeNode(contents));
+
+        extra := __insertChild(pos, newNode);
+        if (extra) {
+            __addTier();
+            __children.append(__makeUnnamedEntry(extra, this));
+            node.size += extra.getSize();
+        }
+    }
+
+    ## Write the last chunk to out, return the start position of the chunk.
+    uint64 __writeLastChunk(Writer out) {
+        if (__isContentNode()) {
+            out.write(node.contents);
+            return 0;
+        } else {
+            @assert(__populateChildren(false));
+            uint64 start;
+            lastChild := __children[-1];
+            offset := lastChild.getNode().__writeLastChunk(out);
+            return offset + getSize() - lastChild.getSize();
+        }
+    }
+
+    ## Write data to a file at 'pos'.
+    ##
+    ## This needs to be applied to the top node of the file.
+    void __write(uint64 pos, Buffer data, int32 time) {
+        class ListWriter @impl Writer {
+            StringArray items = {};
+
+            void write(Buffer data) {
+                items.append(String(data));
+            }
+        }
+
+        ListWriter writer = {};
+        RabinChunker chunker = {writer};
+
+        if (!node.children && !node.contents) {
+
+            # Empty node.
+
+            # We don't have to mix in with anything.
+            chunker.writeZeros(pos - getSize());
+            chunker.write(data);
+            chunker.flush();
+
+            # If there's only one item, we can just replace its contents.
+            # Otherwise, append all of the items to the tree.
+            #
+            # This trick is only appropriate for an empty node, which
+            # can only happen for a toplevel file node (or an empty directory
+            # node, which isn't materially different).  In all other cases,
+            # we need to worry about keeping the tree balanced.
+            if (writer.items.count() == 1) {
+                node.contents = writer.items[0];
+                node.size = node.contents.count();
+                node.children = null;
+                __children = null;
+                __markDirty();
+            } else {
+                # Just append all of the items to the tree.
+                for (item :in writer.items)
+                    append(item);
+            }
+
+        } else if (!(node.contents is null)) {
+
+            # This is a node with contents.
+
+            # Copy the existing contents until we get to 'pos'.
+            if (pos) {
+                if (pos > node.contents.size) {
+                    chunker.write(node.contents);
+                    chunker.writeZeros(pos - node.contents.size);
+                } else {
+                    chunker.write(node.contents.substr(0, pos));
+                }
+            }
+
+            # Write the data.
+            chunker.write(data);
+
+            # If there's content after the data, write it.
+            end := pos + data.size;
+            if (end < node.contents.size)
+                chunker.write(Buffer(node.contents.buffer + uintz(end),
+                                     node.contents.size - end
+                                     )
+                              );
+
+            chunker.flush();
+
+            # Replace the existing contents with the new items.
+            node.contents = null;
+            for (item :in writer.items)
+                append(item);
+
+        # All remaining cases are nodes with children.
+
+        } else if (pos >= getSize()) {
+            # We're writing after the end, just append.
+
+            # Start with the last chunk (we will likely need to extend it).
+            start := __writeLastChunk(chunker);
+
+            # Write the new data.
+            chunker.writeZeros(pos - getSize());
+            chunker.write(data);
+            chunker.flush();
+
+            # Remove the last chunk. Note:  This can break the "no empty inner
+            # nodes" invariant in cases where a node has a single child (which
+            # also breaks an invariant...)
+            __deleteSpan(start, getSize());
+
+            for (item :in writer.items)
+                append(item);
+        } else {
+            # Write beginning in the middle of a node with children.
+
+            # Write the beginning of the first existing chunk.
+            start := __writeChunkPrefix(chunker, pos);
+
+            # Write the data.
+            chunker.write(data);
+
+            # Find the node containing the end position (if any).
+            end := __writeChunkSuffix(chunker, pos + data.size);
+
+            # If we get an end position greater than the size, it just means
+            # that we would have to write the next chunk.  Since there is no
+            # next chunk, just adjust the size.
+            if (end > getSize())
+                end = getSize();
+
+            chunker.flush();
+
+            # Replace all of the chunks in the span.
+            delta := end - start;  orgSize := getContents().size;
+            __deleteSpan(start, end);
+            @assert(getContents().size == orgSize - delta);
+            pos = start;
+            for (item :in writer.items) {
+                __insert(pos, item);
+                pos += item.size;
+            }
+        }
+
+        if (time)
+            node.time = time;
+        __markDirty();
+    }
+
+    ## If "time" is zero, it is ignored.
+    void write(uint64 pos, Buffer data, int32 time) {
+        __write(pos, data, time);
+
+        change := Change();
+        change.type = CHANGE_WRITE;
+        @assert(pos < 0x100000000);
+        change.pos = pos;
+        change.data = String(data);
+        change.time = time;
+        __recordChange(change);
+    }
+
+    ## Set the node modification time.  Unlike all of the other functions, a
+    ## 'time' value of 0 is actually applied to the node, making this the only
+    ## way to set a node's time to 0.
+    void setTime(int32 time) {
+        if (time != node.time) {
+            node.time = time;
+            __markDirty();
+            change := Change();
+            change.type = CHANGE_SETATTR;
+            change.time = time;
+            __recordChange(change);
+        }
+    }
+
+    void __resize(uint64 newSize, int32 time) {
+        if (newSize == node.size) {
+            if (time && time != node.time) {
+                node.time = time;
+                __markDirty();
+            }
+            return;
+        } else if (newSize < node.size) {
+            deleteSpan(newSize, node.size, time);
+        } else {
+            __write(newSize, '', time);
+        }
+    }
+
+    ## Resize contents to the specified size.  Truncate the node if less than
+    ## the existing size, pad with zeroes if greater than the existing size.
+    ## Returns false if unable to accomodate.
+    ## If "time" is zero, it is ignored.
+    bool resize(uint64 newSize, int32 time) {
+        __resize(newSize, time);
+
+        change := Change();
+        change.type = CHANGE_RESIZE;
+        change.newSize = newSize;
+        change.time = time;
+        __recordChange(change);
+
+        return true;
+    }
+
+    ## Returns the node modification time.
+    int32 getTime() {
+        return node.time;
+    }
+
+    ## Commit all outstanding changes in the tree.  Returns the new digest.
+    String commit() {
+        # If our digest is up to date, we don't need to do anything.
+        if (!isDirty())
+            return digest;
+
+        if (__populateChildren(false)) {
+            # Commit all dirty children and reconstruct the child list for the
+            # underlying node.
+            for (child :in __children) {
+                # If there's no child node, it's safe to ignore this child
+                # because it can't be dirty.
+                if (!child.node) {
+                    @assert(child.getDigest());
+                    continue;
+                }
+
+                dig := child.node.commit();
+                curDigest := child.getDigest();
+                if (!curDigest || curDigest != dig)
+                    child.setDigest(dig);
+            }
+        }
+
+        # Commit the node itself.
+        orgDigest := digest;
+        if (__children) {
+            for (child :in __children) {
+                if (!child.entry.hash)
+                    throw AssertionError(
+                        FStr() `Invalid hash for $(child.getName())`
+                    );
+            }
+        }
+
+        digest = __ctx.storeNode(node);
+
+        return digest;
+    }
+
+    ## Utility class for formatting a Change message.  This is useful for
+    ## debugging problems during journal replay.
+    class ChangeFormatter {
+        CachedNode node;
+        Change change;
+        oper init(CachedNode node, Change change) :
+            node = node,
+            change = change {
+        }
+
+        void formatChange(Formatter out) {
+            if (change.type == CHANGE_ADD_CHILD) {
+                out ` add child $(change.name)`;
+            } else if (change.type == CHANGE_DELETE_CHILD) {
+                out ` delete child $(change.name)`;
+            } else if (change.type == CHANGE_WRITE) {
+                out ` write\n`;
+            } else if (change.type == CHANGE_RESIZE) {
+                out ` resize to $(change.newSize)`;
+            } else if (change.type == CHANGE_SETATTR) {
+                out ` change attributes: `;
+                if (change.time)
+                    out `time = $(change.time),`;
+            }
+        }
+
+        void formatTo(Formatter out, CachedNode n, int index) {
+            if (change.path && index < change.path.count()) {
+                n.__populateChildren(true);
+                entry := n.__children[change.path[index]];
+                out I`$(entry.entry.name)`;
+                out `($(change.path[index]))/`;
+                if (!entry.node && !entry.entry.hash) {
+                    out `<NULL HASH>`;
+                    formatChange(out);
+                    return;
+                }
+                formatTo(out, entry.getNode(), ++index);
+            } else {
+                formatChange(out);
+            }
+        }
+
+        void formatTo(Formatter out) {
+            formatTo(out, node, 0);
+        }
+    }
+
+    void __replaceChild(int index, CachedNode node) {
+        @assert(__populateChildren(false));
+        __children[index].node = node;
+    }
+
+    ## Applies a change to the cached node.
+    ##
+    ## Note that this assumes that the  Node object within 'change' can be
+    ## taken for use by a new CachedNode without cloning.
+    void __applyChange(Change change) {
+        if (change.type == CHANGE_ADD_CHILD) {
+            __addChild(change.name, CachedNode(__ctx, null, change.node),
+                       change.time
+                       );
+        } else if (change.type == CHANGE_REPLACE_CHILD) {
+            node := change.node ? change.node :
+                                  __ctx.getNode(change.digest).clone();
+            __replaceChild(change.index,
+                           CachedNode(__ctx, change.digest, node)
+                           );
+        } else if (change.type == CHANGE_DELETE_CHILD) {
+            if (!__populateChildren(false) || !__children.delete(change.name))
+                throw InvalidStateError(
+                    FStr() `replaying delete: can't delete child $(change.name)`
+                );
+            if (change.time)
+                node.time = change.time;
+            __markDirty();
+        } else if (change.type == CHANGE_WRITE) {
+            __write(uint64(change.pos), change.data, change.time);
+        } else if (change.type == CHANGE_RESIZE) {
+            __resize(uint64(change.newSize), change.time);
+        } else if (change.type == CHANGE_SETATTR) {
+            if (change.time) {
+                node.time = change.time;
+                __markDirty();
+            }
+        } else {
+            error `Unrecognized change type $(change.type)`;
+        }
+    }
+
+    ## Lookup a change in the descendent tree, return the descendant that the
+    ## change applies to.
+    CachedNode __lookup(Change change, int index) {
+        if (!change || !change.path || index >= change.path.count())
+            return this;
+
+        # Get the child index from the path.
+        childIndex := change.path[index];
+        __populateChildren(false);
+        @assert(node.children && childIndex < node.children.count());
+        child := __children[childIndex].getNode();
+        if (!child)
+            throw MissingChunkError(
+                __children[childIndex].getDigest(),
+                ' instantiating node in filesystem tree'
+            );
+        return child.__lookup(change, index + 1);
+    }
+
+    ## Replay a single change from the journal.
+    ##
+    ## Returns the new last change digest.
+    ##
+    ## This should only be called on the root node (enforced in
+    ## replayJournal())
+    String __replayChange(ChangeEntry entry, String lastChangeDigest) {
+        change := entry.change;
+        if (!lastChangeDigest) {
+            # First change after a commit.  Verify that the change has a
+            # commit hash that matches the last commit.
+            if (!change.commit)
+                throw InvalidStateError('First change in the journal '
+                                         'does not have a commit field.'
+                                        );
+            if (change.commit != __ctx.getBaselineCommit())
+                throw InvalidStateError(
+                    FStr() I`First change in the journal is for commit \
+                             $(sig(change.commit)) and current commit \
+                             is $(sig(__ctx.getBaselineCommit()))`
+                );
+        } else if (lastChangeDigest != change.lastChange) {
+            throw InvalidStateError(
+                FStr() I`Change $(sig(entry.digest)) should be \
+                         applied to $(sig(change.lastChange)). \
+                         last change was $(sig(lastChangeDigest)).`
+            );
+        }
+        node := __lookup(change, 0);
+        @assert(node);
+        node.__applyChange(change);
+        if (change.sessionId)
+            __ctx.storeSessionId(change.sessionId);
+        return entry.digest;
+
+    }
+
+    String replayChange(ChangeEntry entry, String lastChangeDigest) {
+        result := __replayChange(entry, lastChangeDigest);
+        __ctx.setLastChange(result);
+        return result;
+    }
+
+    ## Replay all journal entries against the node.  If the node doesn't have
+    ## a digest or there are no changes, does nothing.  Should only be used on
+    ## the root node.
+    void replayJournal() {
+        if (parent)
+            throw InvalidArgumentError('Replay journal only works against the '
+                                        'root node.'
+                                       );
+
+        String lastChangeDigest;
+        for (entry :in __ctx.makeJournalIter()) {
+            lastChangeDigest = __replayChange(entry, lastChangeDigest);
+        }
+
+        # Store this in the context.
+        __ctx.setLastChange(lastChangeDigest);
+    }
+
+    ## Replays the journals of 'a' and 'b' until the point where they diverge.
+    ##
+    ## This is used to obtain the common ancestor in the case of two branches
+    ## that have diverged since their baseline commit.
+    void replayJournalUntilDivergence(JournalIter a, JournalIter b) {
+        String lastChangeDigest;
+        while (a && b) {
+            aEntry := a.elem();
+            if (aEntry.change != b.elem().change)
+                break;
+            lastChangeDigest = __replayChange(aEntry, lastChangeDigest);
+            a.next();
+            b.next();
+        }
+        __ctx.setLastChange(lastChangeDigest);
+    }
+
+    ## Replay the journal until we encounter the specified changeDigest.
+    ##
+    ## If the change is not encountered, throws InvalidArgumentError.
+    void replayJournalUntilChange(String changeDigest) {
+        String lastChangeDigest;
+        for (entry :in __ctx.makeJournalIter()) {
+            lastChangeDigest = __replayChange(entry, lastChangeDigest);
+            if (lastChangeDigest == changeDigest) {
+                __ctx.setLastChange(lastChangeDigest);
+                return;
+            }
+        }
+        throw InvalidArgumentError(
+            FStr() I`Change $(sig(changeDigest)) not found in journal for \
+                     $(__ctx.getBranch())\n`
+        );
+    }
+
+    uint read(uint64 pos, WriteBuffer buffer) {
+        if (pos > node.size)
+            return 0;
+
+        buffer.size = 0;
+        if (node.contents) {
+
+            # We've got contents, read from there.
+            if (pos < node.contents.size) {
+                uint size;
+                if (buffer.cap >= node.contents.size - pos)
+                    size = node.contents.size - pos;
+                else
+                    size = buffer.cap;
+                buffer.move(0, node.contents.buffer + pos,
+                            size
+                            );
+                buffer.size = size;
+            } else {
+                buffer.size = 0;
+            }
+        } else if (node.children) {
+
+            WriteBuffer frame = {null, 0, 0};
+            @assert(__populateChildren(false));
+            for (child :in __children) {
+                if (pos < child.getSize()) {
+
+                    # Delegate the operation to the child
+
+                    # Make the frame buffer the remaining part of the input
+                    # buffer.
+                    frame.buffer = buffer.buffer + buffer.size;
+                    frame.cap = buffer.cap - buffer.size;
+                    frame.size = 0;
+
+                    # Pass this off to the child.
+                    amtRead := child.getNode().read(pos, frame);
+                    buffer.size += amtRead;
+
+                    # Quit if we've filled the buffer.
+                    if (buffer.size == buffer.cap)
+                        break;
+
+                    # Reset pos to zero so we start at the beginning of the
+                    # next child.
+                    pos = 0;
+                } else {
+                    # Fix the position to be relative to the start of the next
+                    # child.
+                    pos -= child.getSize();
+                }
+            }
+        }
+
+        return buffer.size;
+    }
+
+
+    void __pruneCleanNodes() {
+        if (!isDirty())
+            __release(false);
+    }
+
+    void garbageCollect() {
+        __pruneCleanNodes();
+
+        # TODO: move this entirely into the NodeContext.
+        totalSize := getRoot().getRSize();
+        if (totalSize > __ctx.getGCThreshold()) {
+            info I`running garbage collection (total size $totalSize \
+                   threshold = $(__ctx.getGCThreshold())`;
+            __ctx.garbageCollect();
+        }
+    }
+
+    @struct VerifyReport {
+        uint64 size;
+        uint depth;
+    }
+
+    ## Recursively verify the integrity of the entire subtree of this node.
+    ## If 'materializeAll' is set, all nodes not in memory will be
+    ## materialized during the traversal (note that this may not be practical
+    ## for very large trees).
+    VerifyReport verify(bool materializeAll) {
+
+        # If the node isn't dirty, verify that we have a correct digest.
+        if (!isDirty()) {
+            @assert(digest);
+            @assert(digest == __ctx.makeDigest(node));
+        }
+
+        if (node.contents) {
+            @assert(node.contents.size == node.size);
+            @assert(node.contents.size <= __ctx.getMaxContentSize());
+            return VerifyReport(node.contents.size, 1);
+        } else if (node.children) {
+            @assert(__populateChildren(false));
+            @assert(node.children.count() == __children.count());
+            uint64 totalSize;
+            uint depth = 0;
+            for (child :in __children) {
+                @assert(child.getParent() is this);
+                totalSize += child.getSize();
+
+                if (materializeAll) {
+                    childReport := child.getNode().verify(true);
+                    @assert(child.getSize() == childReport.size);
+                    @assert(child.getNode().parent is this);
+
+                    # Verify that the depth of all children is the same.  This
+                    # property only holds for file nodes - directories can have
+                    # descendent trees of arbitrary depth.
+                    if (!isDir()) {
+                        if (depth) {
+                            @assert(depth == childReport.depth);
+                        } else {
+                            depth = childReport.depth;
+                        }
+                    }
+                }
+            }
+            @assert(node.size == totalSize);
+
+            return VerifyReport(totalSize, depth + 1);
+        } else {
+            return VerifyReport(0, 1);
+        }
+    }
+
+    VerifyReport verify() { return verify(true) }
+
+    void formatTo(Formatter out) {
+        indent := Indenter.wrap(out);
+        indent `CachedNode {\n`;
+        __populateChildren(false);
+        ++indent;
+        int min(int a, int b) { return (a < b) ? a : b }
+        indent I`hash: $(sig(digest))
+                 size: $(node.size)
+                 contents: $(!(node.contents is null) ?
+                                node.contents.substr(0, min(node.contents.size,
+                                                         10)).getRepr() :
+                                'null'
+                             )
+                 entries: $__children\n`;
+        --indent;
+        indent `}`;
+    }
+
+    ## Pre-order traverse all resident nodes in the tree.
+    void traverseResident(Functor1[void, CachedNode] callback) {
+        callback(this);
+        if (__children) {
+            for (child :in __children) {
+                if (child.node)
+                    child.node.traverseResident(callback);
+            }
+        }
+    }
+
+    ## The rules for ordinality are:
+    ## 1) a node with children is always greater than a node without.
+    ## 2) for nodes with children, the rules of normal sequences apply.
+    ## 3) nodes without children are ordered by their content.
+    int cmp(CachedNode other) {
+        if (!isDirty() && !other.isDirty() && digest == other.digest)
+            return 0;
+
+        if (__populateChildren(false)) {
+            if (!other.__populateChildren(false))
+                # This is an inner node, other is not.
+                return 1;
+
+            # Both nodes are inner nodes.  Compare children.
+            for (int i = 0; i < __children.count(); ++i) {
+                if (i >= other.__children.count())
+                    return 1;
+
+                # Compare names of the children.
+                diff :=
+                    cmp(__children[i].getName(), other.__children[i].getName());
+                if (diff)
+                    return diff;
+
+                # Compare to the other's child.
+                diff = __children[i].getNode().cmp(other.__children[i].getNode());
+                if (diff)
+                    return diff;
+            }
+
+            return (other.__children.count() > __children.count()) ? -1 : 0;
+        } else {
+            # This is a content node.
+            # If the other node is an inner node, it is greater.
+            if (other.__populateChildren(false))
+                return -1;
+
+            # Compare contents.
+            if (node.contents > other.node.contents)
+                return 1;
+            else
+                return (node.contents < other.node.contents) ? -1 : 0;
+        }
+    }
+
+    int cmp(Object other) {
+        if (o := CachedNode.cast(other, null))
+            return cmp(o);
+        else
+            return Object.cmp(other);
+    }
+
+    ## Returns a copy of the node the node to the new context.
+    ##
+    ## It is the responsibility of the caller to set 'parent' on the new node.
+    ##
+    ## This is primarily intended to facilitate a merge operation, not to move
+    ## a node -- it's not certain how well this will work in that case.
+    CachedNode copy(NodeContext ctx) {
+        result := CachedNode(ctx, digest, node.clone());
+
+        # If we're dirty and have a cached child array, we need to copy all
+        # dirty children.
+        if (isDirty() && __children) {
+            @assert(result.__populateChildren(true));
+            for (int i; i < __children.count(); ++i) {
+                child := __children[i];
+                if (child.node) {
+                    if (child.node.isDirty()) {
+                        # Dirty child, copy it.
+                        cachedNode := child.node.copy(ctx);
+                        result.__children[i].node = cachedNode;
+                        cachedNode.parent = result;
+                    } else {
+                        # Clean child, Clear the original that doesn't
+                        # belong to us and make sure our entry digest is in
+                        # sync with the contents of the node. (we don't need
+                        # to do size, that's kept in sync throughout the code,
+                        # but the digest may rely on a commit).
+                        result.__children[i].node = null;
+                        result.__children[i].setDigest(child.node.digest);
+                    }
+                }
+            }
+        }
+        return result;
+    }
+}
+
+CachedNode makeCachedNode(CachedNode parent, NodeContext ctx, String digest) {
+    node := ctx.getNode(digest);
+    if (!node)
+        return null;
+
+    result := CachedNode(ctx, digest, node);
+    result.parent = parent;
+    return result;
+}
+
+NodeWriter _makeWriteFile(NodeContext ctx) {
+    class NodeWriterImpl @impl NodeWriter {
+        CachedNode node;
+        uint64 pos;
+
+        oper init(NodeContext ctx) : node = CachedNode(ctx, null, Node()) {}
+
+        void write(Buffer data) {
+            node.write(pos, data, 0);
+            pos += data.size;
+        }
+
+        String commit() {
+            return node.commit();
+        }
+    }
+
+    return NodeWriterImpl(ctx);
+}
+
+Reader _makeReadFile(NodeContext ctx, String digest) {
+    # TODO: NodeReader and NodeWriter should probably be broken out and used
+    # by both this code and mawfs.path.
+    class NodeReaderImpl @impl Reader {
+        CachedNode node;
+        uint64 pos;
+        oper init(NodeContext ctx, String digest) :
+            node = makeCachedNode(null, ctx, digest) {
+        }
+
+        uint read(WriteBuffer buffer) {
+            if (!node) {
+                buffer.size = 0;
+                return 0;
+            }
+            rc := node.read(pos, buffer);
+            if (rc > 0)
+                pos += rc;
+            return rc;
+        }
+    }
+
+    return NodeReaderImpl(ctx, digest);
+}
+
+class OrphanContext : NodeContext._OrphanContextBase {
+    CachedNode root;
+    oper init(NodeContext other) : NodeContext._OrphanContextBase(other) {
+        node := Node();
+        node.mode = MODE_DIR;
+        root = CachedNode(this, null, node);
+    }
+
+    void addChange(Change change) {}
+    bool shouldCommit() { return false }
+
+    void addOrphan(CachedNode node) {
+        root.addChild(FStr() `$(uintz(node))`, node, 0);
+    }
+}
+
+Object _makeOrphanContext(NodeContext context) {
+    return OrphanContext(context);
+}
+
+## Facade for a complete cached filesystem tree representing the head of a
+## branch.
+@final class Tree {
+    NodeContext __ctx;
+    CachedNode __root;
+
+    # Nullable.
+    String __targetChange;
+
+    ## Create from a NodeStore and branch name,
+    oper init(NodeStore store, String branch) :
+        __ctx(store, Cache(), branch) {
+    }
+
+    ## Create from an existing node context.  Both the NodeStore and the Cache
+    ## from 'context' will be used, but a new branch will be created.
+    oper init(NodeStore context, Cache cache, String branch) :
+        __ctx(context, cache, branch) {
+    }
+
+    ## Create the tree for a given root node.
+    oper init(CachedNode root) : __ctx = root.getContext(), __root = root {}
+
+    ## Set the target change (for creating a tree from a specific change).
+    ## Must be called prior to initialize().
+    ##
+    ## targetChange may be null.
+    void setTargetChange(String targetChange) {
+        if (__root)
+            throw InvalidStateError(
+                'Setting target change after initialization.'
+            );
+        __targetChange = targetChange;
+    }
+
+    ## Initialize the tree if it's not already initialized.  This obtains the
+    ## current head revision and root node and replays the journal, so it's a
+    ## fairly heavy operation.
+    @final void initialize() {
+        if (!__root) {
+            commitDigest := __ctx.getHead();
+            info `loading commit $(sig(commitDigest))`;
+            commit := __ctx.getCommit(commitDigest);
+            if (!commit)
+                throw MissingChunkError(commitDigest, null);
+
+            # Store the commit digest now that we've got it.
+            __ctx.recordCommit(commitDigest);
+
+            info `loading root $(sig(commit.root))`;
+            rootNode := __ctx.getNode(commit.root);
+            if (!rootNode)
+                throw MissingChunkError(
+                    commit.root,
+                    FStr() ` obtaining tree root`
+                );
+            __root = CachedNode(__ctx, commit.root, rootNode);
+            if (__targetChange)
+                __root.replayJournalUntilChange(__targetChange);
+            else
+                __root.replayJournal();
+        }
+    }
+
+    ## Returns the root node for the tree.  Calls 'initialize()', so it's
+    ## always safe to call this.
+    @final CachedNode getRoot() {
+        initialize();
+        return __root;
+    }
+
+    ## Returns the tree's NodeContext.  Calls 'initialize()', so it's
+    ## always safe to call this.
+    @final NodeContext getContext() {
+        initialize();
+        return __ctx;
+    }
+
+    ## Commit the tree.  This ends up setting the local branch head and
+    ## clearing the journal as well as doing garbage collection.  Note that
+    ## this will call 'initialize()' so it's safe to call this at any time.
+    ##
+    ## metadata: nullable, user-provided metadata.
+    @final void commit(String comment, CommitMetadata metadata) {
+        initialize();
+        __root.commitTree(null, metadata);
+    }
+
+    ## Same as commit(String, CommitMetadata) only without an alt digest or
+    ## metadata.
+    @final void commit() {
+        commit(null, null);
+    }
+}

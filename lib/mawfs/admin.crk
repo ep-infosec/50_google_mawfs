@@ -1,0 +1,406 @@
+# Copyright 2016 Google Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+## MAWFS admin interface.  This provides the ".mawfs" directory allowing
+## interactions with the underlying filesystem daemon.
+
+import crack.cont.array Array;
+import crack.cont.treemap TreeMap;
+import crack.io FStr, SeekableReader, SeekableWriter, StringReader;
+import crack.fieldset FieldSet;
+import crack.functor Functor1, Function1, Functor0, Function0;
+import crack.fs Path, PathIter, PathStat;
+import crack.lang AppendBuffer, Buffer, Exception, SystemError, WriteBuffer;
+import crack.logger debug;
+import crack.runtime ENOENT, ENOTDIR, EEXIST, EINVAL, S_IFDIR, S_IFREG, SEEK_CUR,
+    SEEK_END, SEEK_SET;
+import mawfs.cache CachedNode;
+import .nonces NonceManager;
+import .path AdminDirFactory, MAWFSPath;
+
+@import crack.ann impl, interface;
+@import crack.fieldset_ann fieldset_accessors;
+
+alias PathMap = TreeMap[String, Path];
+
+@export_symbols PathMap;
+
+class AdminPathIter : PathIter {
+    PathMap.Iter __iter;
+    oper init(PathMap.Iter iter) : __iter = iter {}
+    Path elem() { return __iter.elem().val }
+    bool next() { return __iter.next() }
+    bool isTrue() { return __iter; }
+}
+
+## Writes a request and then calls a callback when complete
+class RequestWriter @impl SeekableWriter {
+    AppendBuffer buf = {1024};
+    Functor1[void, Buffer] callback;
+
+    oper init(Functor1[void, Buffer] callback) : callback = callback {}
+
+    void write(Buffer data) {
+        buf.extend(data);
+    }
+
+    ## Implement seek, but we ignore it.  Users of admin interfaces are
+    ## expected to write sequentially.
+    int64 seek(int64 offset, int whence) {
+        return int64(buf.size);
+    }
+
+    int64 tell() {
+        return int64(buf.size);
+    }
+
+    oper del() {
+        callback(buf);
+    }
+}
+
+class AdminPath : Path {
+
+    String name;
+    bool __exists;
+    PathMap _children;
+    Path __parent;
+
+    ## Functor called when we write to the file.  If null, the file is not
+    ## writable.
+    Functor1[void, Buffer] onWrite;
+
+    ## Functor called to get the contents before we read from the file.  If
+    ## null, the file is not readable.
+#    Functor0[String] onRead;
+
+    String _getContents() {
+        debug `calling AdminPath._getContents() for $(this.class.name)`;
+        return null;
+    }
+
+    oper init(String name, bool exists) : name = name, __exists = exists {}
+
+    SeekableWriter appender() {
+        if (!onWrite)
+            throw SystemError('Append not supported.', EINVAL);
+        return RequestWriter(onWrite);
+    }
+
+    PathIter children() {
+        if (_children is null)
+            throw SystemError('Not a directory', ENOTDIR);
+        return AdminPathIter(_children.iter());
+    }
+
+    # delete() is implemented as a no-op so we can delete directories.
+    void delete() {}
+
+    bool exists() { return __exists }
+
+    int getAccessTime() { return 0 }
+
+    int getCreateTime() { return 0 }
+
+    String getFullName() {
+        return FStr() `$(__parent ? __parent.getFullName() : '')/$name`;
+    }
+
+    int getModTime() { return 0 }
+
+    int getMode() {
+        if (_children is null)
+            return 0644;
+        else
+            return 0755;
+    }
+
+    String getName() { return name }
+
+    uint64 getSize() {
+        contents := _getContents();
+        if (contents)
+            return contents.size;
+        else if (isDir())
+            return 4096;
+        else
+            return 0;
+    }
+
+    PathStat getStat() {
+        if (!__exists)
+            throw SystemError('Does not exist.', ENOENT);
+        PathStat stat = {};
+
+        # The only attributes for the underlying filesystem are "directory"
+        # and "executable".  Everything else is a normal file.
+        # TODO: Make permissions configurable at the cache level.
+        if (isDir())
+            stat.st_mode = 0755 | S_IFDIR;
+        else
+            stat.st_mode = 0644 | S_IFREG;
+
+        # TODO: change this to the user/group that started the server.
+        stat.st_uid = 0;
+        stat.st_gid = 0;
+        stat.st_nlink = 1;
+        return stat;
+    }
+
+    bool isDir() {
+        return !(_children is null);
+    }
+
+    bool isExecutable() { return false }
+    bool isLink() { return false }
+
+    void makeDir(bool errorOnExists) {
+        throw SystemError("You can't create a directory here.", EINVAL);
+    }
+
+    SeekableReader reader() {
+        if (!__exists || isDir())
+            throw SystemError('Does not exists', ENOENT);
+        contents := _getContents();
+        if (contents is null)
+            throw SystemError('File is not readable', EINVAL);
+        return StringReader(contents);
+    }
+
+    SeekableWriter writer() {
+        if (!__exists || isDir())
+            throw SystemError('Does not exist', ENOENT);
+        return RequestWriter(onWrite);
+    }
+
+    Path parent() { return __parent }
+
+    void truncate(uint64 newSize) {
+        throw SystemError('Truncate unsupported', EINVAL);
+    }
+
+    void moveTo(Path other) {
+        throw SystemError('Move unsupported', EINVAL);
+    }
+
+    Path oper [](String child) {
+        if (_children && realChild := _children.get(child))
+            return realChild;
+        return AdminPath(child, isDir() && _children.hasKey(child));
+    }
+
+    Path oper /(String other) {
+        return this[other];
+    }
+
+    void setMode(int mode) {
+        throw SystemError('chmod unsupported', EINVAL);
+    }
+
+    Path moveToDir(Path other) {
+        throw SystemError('mv unsupported', EINVAL);
+    }
+
+    Path _createNode(String  path) { return null }
+}
+
+## An admin file containing a simple chunk of static data.
+class DataFile : AdminPath {
+    String __contents;
+
+    oper init(String name, String contents) :
+        AdminPath(name, true),
+        __contents = contents {
+    }
+
+    String _getContents() {
+        return __contents;
+    }
+}
+
+## .mawfs/branch file.  Contents is the current branch name.
+class BranchFile : AdminPath {
+    CachedNode root;
+    oper init(CachedNode root, String name) :
+        AdminPath(name, true),
+        root = root {
+    }
+
+    String _getContents() {
+        return root.getContext().getBranch();
+    }
+}
+
+## Interface for classes that provide the contents of the "alt" directory.
+@interface AltSourceDir {
+
+    ## Get the map of all branch directories.
+    @abstract PathMap getBranches();
+
+    ## Create a new directory containing the branch.  Returns null if the
+    ## branch is not currrently defined.
+    @abstract MAWFSPath makeBranchDir(String name);
+
+    @fieldset_accessors(AltSourceDir);
+}
+
+## BranchDir exists as a stand-in for branch subdirectories of AltDir that
+## don't exist yet.
+class BranchDir : AdminPath {
+    AltSourceDir __source;
+    AdminPath __parent;
+
+    oper init(AdminPath parent, String name, AltSourceDir source) :
+        AdminPath(name, false),
+        __source = source,
+        __parent = parent {
+    }
+
+    void makeDir(bool errorOnExists) {
+        import crack.logger info;
+        if (__parent._children.hasKey(name)) {
+            if (errorOnExists)
+                throw SystemError('Branch directory already exists', EEXIST);
+            else
+                return;
+        }
+
+        # We don't need to add the branch to _children, makeBranchDir() does
+        # this for us.
+        branch := __source.makeBranchDir(name);
+        if (!branch)
+            throw SystemError('Branch does not exists', ENOENT);
+    }
+}
+
+class AltDir : AdminPath {
+    AltSourceDir __source;
+
+    oper init(String name, AltSourceDir source) :
+        AdminPath(name, true),
+        __source = source {
+
+        _children = source.getBranches();
+    }
+
+    Path oper [](String child) {
+        if (c := _children.get(child))
+            return c;
+
+        # If the node doesn't exist in _children, we create a BranchDir so
+        # that the caller can create it.  Don't store it in children, that
+        # would create a reference cycle.
+        return BranchDir(this, child, __source);
+    }
+}
+
+## A dictionary of strings containing the contents of information files to be
+## placed directly in the .mawfs directory.
+class InfoFiles : TreeMap[String, String] {
+
+    NonceManager __nonceMan;
+
+    oper init(NonceManager nonceMan) : __nonceMan = nonceMan {
+        # We stuff this into the tree-map specifically so that we can iterate
+        # over the set of elements,  Note that this will break if we ever
+        # acccess the "val" attribute of the item during iteration.
+        this['nonce'] = '';
+    }
+
+    String get(String key, String default) {
+        return key == 'nonce' ? __nonceMan.get() :
+                                TreeMap[String, String].get(key, default);
+    }
+
+    @fieldset_accessors(InfoFiles);
+}
+
+## Directory object containing the "inst" dir which contains static info files.
+class InstInfoDir : AdminPath {
+    InfoFiles __infoFiles;
+
+    oper init(String name, InfoFiles infoFiles) :
+        AdminPath(name, true),
+        __infoFiles = infoFiles {
+    }
+
+    bool isDir() { return true }
+    int getMode() { return 0755 }
+
+    PathIter children() {
+        class Iter : PathIter {
+            InfoFiles.Iter __rep;
+            oper init(InfoFiles.Iter rep) : __rep = rep {}
+            Path elem() {
+                return __rep ? DataFile(__rep.elem().key, __rep.elem().val) : null;
+            }
+            bool next() { return __rep.next() }
+            bool isTrue() { return __rep }
+        }
+
+        return Iter(__infoFiles.iter());
+    }
+
+    Path oper [](String child) {
+        contents := __infoFiles.get(child);
+        if (!(contents is null))
+            return DataFile(child, contents);
+
+        # Non-existant child.
+        return AdminPath(child, false);
+    }
+
+    void makeDir(bool errorOnExists) {
+        throw SystemError('Can not create anything in an info dir.');
+    }
+}
+
+const README_CONTENTS :=
+    I'\
+    MAWFS Filesystem.
+    Copyright 2016 Google Inc. All Rights Reserved.
+
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+    ';
+
+
+## File object for the root of the admin tree (the '.mawfs' directory).
+class AdminRoot : AdminPath {
+    oper init(CachedNode root, String name) : AdminPath(name, true) {
+        _children = PathMap();
+        _children['README'] = DataFile('README', README_CONTENTS);
+        _children['branch'] = BranchFile(root, 'branch');
+        if (altSourceDir := AltSourceDir.get(root.getContext()))
+            _children['alt'] = AltDir('alt', altSourceDir);
+        _children['inst'] =
+            InstInfoDir('inst', InfoFiles.get(root.getContext()));
+    }
+}
+
+class AdminRootFactory : AdminDirFactory {
+    Path oper call(CachedNode root, String name) {
+        return AdminRoot(root, name);
+    }
+}
+

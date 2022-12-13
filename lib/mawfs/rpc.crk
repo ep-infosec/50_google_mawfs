@@ -1,0 +1,1427 @@
+## MAWFS RPC client.
+
+import crack.ascii parseInt;
+import crack.cont.array Array;
+import crack.cont.hashmap HashMap;
+import crack.functor Functor3;
+import crack.io cerr, Formatter, FStr, StringWriter, Reader;
+import crack.lang cmp, makeHashVal, AppendBuffer, Exception,
+    InvalidArgumentError, WriteBuffer;
+import crack.logger.ctx Log;
+import crack.net resolve, Address, InetAddress;
+import crack.net.comm2 Comm, Connection, ConnectionFactory, NewConnection,
+    UserHandler, Waiter;
+import crack.protobuf readMessageFromString, Field, Message, ProtoWriter;
+import crack.rawptr RawPtr;
+import crack.regex Regex;
+import crack.serial SerialReader, SerialWriter;
+import crack.threads MutexLock;
+import crack.net.ssl SSLConnection, SSLContext;
+
+import .blockstore Commit, CommitMetadata;
+import .ciphers Cipher, sha256;
+import .entropy getEntropySource;
+import .rawchunk GeneralCallback, JournalBlock, RawChunkReader;
+
+@import crack.ann assert, cvars, impl, implements, interface, struct;
+@import crack.protobuf.ann protobuf;
+
+const DEFAULT_PORT := 9119
+const IPV4_ADDR := Regex(r'(\d+)\.(\d+)\.(\d+)\.(\d+)');
+
+## Raised when there is an application error.
+class AppError : Exception {
+    oper init(String message) : Exception(message) {}
+}
+
+## Raised when we discover that a peer has been disconnected while sending a
+## message.
+class PeerDisconnectedError : Exception {}
+
+@protobuf {
+    version = 1
+
+    ## The general RPC message envelope.  Everything gets sent across the wire
+    ## in a serialized string containing one of these.
+    message RPCMessage {
+
+        ## The message id.  When sent with a request, the response should have
+        ## the same id.  Messages without a non-zero message id are presumed
+        ## to be asynchronous and don't get a response.
+        optional int32 id = 1;
+
+        ## The message to be called.  Should only be present for a request.
+        ## If it is absent (or empty), the message is assumed to be a
+        ## response.
+        optional string method = 2;
+
+        ## The request body.  Should only be present for a request. This will
+        ## be another protobuf appropriate for the "request" part of the
+        ## method.
+        optional string request = 3;
+
+        ## The response body. Should only be present for a response.  The
+        ## response protobuf.
+        optional string response = 4;
+
+        ## If there was an error processing a message, this gets returned in
+        ## the response.
+        optional string error = 5;
+    }
+
+    message GetObjectRequest {
+        ## Message digest.
+        optional string digest = 1;
+    }
+
+    message GetObjectResponse {
+        optional string data = 1;
+    }
+
+    message GetHeadRequest {
+        optional string branch = 1;
+    }
+
+    message GetHeadResponse {
+        optional string digest = 1;
+    }
+
+    message GetFileRequest {
+        optional string filename = 1;
+    }
+
+    message GetFileResponse {
+        optional string data = 1;
+    }
+
+    message GetJournalBlockRequest {
+        optional bytes firstBlockDigest = 1;
+        optional string branch = 2;
+        optional int32 pos = 3;
+    }
+
+    message GetJournalBlockResponse {
+        optional bytes firstBlockDigest = 1;
+        optional bytes contents = 2;
+        optional bool done = 3;
+    }
+
+    ## Note that this is also used for pushBranch (which sends the same data).
+    message PullBranchRequest {
+        optional string branch = 1;
+        optional string peer = 2;
+
+        ## If present and true, 'peer' is ignored and the pull is done from
+        ## the client that initiated the pull.  This message may only be sent
+        ## from a peer.
+        optional bool fromClient = 3;
+
+        ## Only used for pushBranch.  If specified, this should be one of the
+        ## TRAVERSE_* constants below plus one (and really only TRAVERSE_FULL
+        ## and TRAVERSE_DELTA, hence the +1 so that we can make TRAVERSE_NONE
+        ## the default).
+        optional int32 traverse = 4;
+    }
+
+    ## Also used for pushBranch.
+    message PullBranchResponse {
+        optional string localName = 1;
+    }
+
+    message MergeRequest {
+        optional string branch = 1;
+    }
+
+    message MergeResponse {
+        ## If we were able to merge clean, commit is set to the digest of the
+        ## new commit and mergeBranch is null.  Otherwise, mergeBranch is the
+        ## name of the temporary merge branch.
+        optional string mergeBranch = 1;
+        optional string commit = 2;
+        repeated string conflict = 3;
+    }
+
+    message AddPeerRequest {
+        optional string peerName = 1;
+        optional string peerAddr = 2;
+    }
+
+    message InfoResponse {
+        optional string mountpoint = 1;
+        optional string name = 2;
+    }
+
+    message LoginRequest {
+
+        ## Sent for the first request of a p2p login,  Contains an encrypted
+        ## random string.
+        optional string challenge = 1;
+
+        ## Sent for the second request of a p2p login.  Contains the SHA256
+        ## digest of the server's decrypted challenge string.
+        optional string response = 2;
+
+        ## Sent during the login request from a client with access to the
+        ## local filesystem.  Consists of a secret obtained from the special
+        ## .mawfs/otp file.
+        optional string nonce = 3;
+    }
+
+    message LoginResponse {
+        ## Sent in response to the first request of a p2p login.  Contains the
+        ## SHA256 hash of the client's decrypted challenge string.
+        optional string response = 1;
+
+        ## Sent in response to the first request of a p2p login.  Contains an
+        ## encrypted random string for the client to respond to.
+        optional string challenge = 2;
+
+        # Sent in response to an invalid login attempt (the challenge string
+        # was not encrypted correctly).
+        optional string error = 3;
+    }
+
+    message TraverseRequest {
+        optional string branch = 1;
+        optional int32 algo = 2;
+    }
+
+    message PeerConnectedRequest {
+        optional string peerName = 1;
+    }
+
+    message GetCommitRequest {
+        ## This can either be an alt-base64 encoded commit id or a branch tag.
+        optional string commitOrTag = 1;
+    }
+
+    declare Commit;
+
+    message CommitAndDigest {
+        optional Commit commit = 1;
+        optional bytes digest = 2;
+    }
+
+    declare CommitMetadata;
+
+    message CommitRequest {
+        optional CommitMetadata metadata = 1;
+    }
+}
+
+const int
+    ## No traversal.  Note that this is different from the other traversal
+    ## types, in that it is dealt with on the client side and is therefore
+    ## never sent over an RPC.  However, we include it here for completeness.
+    TRAVERSE_NONE = -1,
+
+    ## Try to traverse every node and commit in the branch.
+    TRAVERSE_FULL = 0,
+
+    ## Traverse until we arrive at chunks that have already been recorded as
+    ## fully traversed.
+    TRAVERSE_DELTA = 1;
+
+class MergeResult : MergeResponse {
+    oper init(String mergeBranch, String commit, Array[String] conflicts) {
+        this.mergeBranch = mergeBranch;
+        this.commit = commit;
+        conflict = conflicts;
+    }
+}
+
+class PeerProxy;
+
+## Stores information about a pending login challenge.
+@abstract class LoginState {
+
+    ## The challenge string to be sent to the client.
+    String challenge;
+
+    ## The response to the client's challenge.
+    String response;
+
+    ## Returns true if 'response' is a valid response to our challenge.
+    @abstract bool verifyResponse(String response);
+}
+
+## Thrown when something goes wrong in the login flow.
+class LoginError : Exception {
+    oper init(String message) : Exception(message) {}
+}
+
+## Encapsulates information on the pre-shared-key.
+@struct PSKInfo {
+    String psk;
+
+    ## True if the client has been authenticated.  If not, this is either an
+    ## invalid or an anonymous connection.
+    bool authenticated;
+}
+
+## The interface for mawfs.flows.MAWFSInstance, which is how the RPC system
+## communicates to the broader system.
+@interface InstIFace {
+    @abstract void pullBranch(String branch, String peer,
+                              GeneralCallback[String] callback
+                              );
+    @abstract void pushBranch(String branch, String peer, int traverse,
+                              GeneralCallback[String] callback
+                              );
+
+    @abstract void merge(String
+                         branch, GeneralCallback[MergeResponse] callback
+                         );
+
+    @abstract void resolve(GeneralCallback[int] callback);
+    @abstract void cancelMerge(GeneralCallback[int] callback);
+    @abstract void addPeer(String peerName, String peerAddr,
+                           GeneralCallback[int] callback
+                           );
+    @abstract InfoResponse getInfo();
+    @abstract void traverse(String branch, int algo,
+                            GeneralCallback[int] callback
+                            );
+
+    @abstract void getCommit(String digestOrBranch,
+                             GeneralCallback[CommitAndDigest] callback
+                             );
+
+    @abstract void commit(CommitMetadata metadata,
+                          GeneralCallback[int] callback
+                          );
+
+    ## Responds to a login challenge from a client.
+    @abstract LoginState answerChallenge(String challenge);
+
+    ## Returns true if 'nonce' is a valid nonce provided from the instance
+    ## filesystem.
+    @abstract bool validNonce(String nonce);
+
+    ## Returns the PSK for a given identity.
+    @abstract PSKInfo getPSK(String identity);
+
+    @abstract int peerConnected(String name, PeerProxy proxy);
+}
+
+@interface ResultHandler {
+    alias Info = int;
+    @abstract void setResponse(RPCMessage result);
+    @abstract Info getInfo();
+}
+
+class RPCWaiter : Waiter @implements ResultHandler {
+
+    # This class was stolen from WaiterFor[], which should be replaced with
+    # something like this and GeneralCallback.  Aliasing the generic's
+    # parameter types to emphasize this point.
+    alias Result = RPCMessage;
+    alias Info = int;
+
+    Result __result;
+    Exception __exception;
+    Info info;
+
+    oper init(Info info) : info = info {}
+
+
+    void setResponse(Result result) {
+        MutexLock lock = {_event.getMutex()};
+        __result = result;
+        _signal();
+    }
+
+    Result getResult() {
+        MutexLock lock = {_event.getMutex()};
+        _event.wait();
+        if (__exception)
+            throw __exception;
+        return __result;
+    }
+
+    Info getInfo() {
+        return info;
+    }
+}
+
+## ResultHandler that calls a callback.  Derived classes must implement
+## setResponse().
+##
+## Unfortunately we have to make this derived from Waiter because comm2
+## doesn't have a way to pass anything other than a Waiter through to the
+## handler.  Otherwise we could just make RPCCallbackAdapter implement
+## ResultHandler.
+@abstract class RPCCallback : Waiter @implements ResultHandler {
+    int info;
+
+    int getInfo() {
+        return info;
+    }
+}
+
+class _FakeReader @impl Reader {
+    uint read(WriteBuffer buf) {
+        return buf.size = 0;
+    }
+}
+
+## Reads protobuf strings from an append buffer.
+class _BufferSerialReader {
+    AppendBuffer __buffer = {4096};
+    SerialReader __reader = {_FakeReader()};
+
+    oper init(AppendBuffer buffer) : __buffer = buffer {
+        __reader.buf = __buffer;
+    }
+
+    ## Read a string, returns null if no complete string is in the buffer.
+    @final String readString() {
+        return __reader.readString(false);
+    }
+}
+
+## RPC message context associated with a connection.
+class Context {
+    Log log;
+    RawChunkReader reader;
+    InstIFace inst;
+    LoginState loginState;
+
+    ## The name of the peer that made the RPC request.  This is null if either
+    ## 1) the connection did not come from a peer or 2) the peerConnected
+    ## rpc has not yet been processed.
+    String peerName;
+
+    ## Gets set to true when the client has completed authentication.
+    bool authenticated;
+
+    oper init(RawChunkReader reader, InstIFace inst) :
+        reader = reader,
+        inst = inst {
+    }
+
+    oper init(Log log) : log = log {}
+
+    ## Utility function for writing a response message.
+    void writeResponse(Connection comm, Message response, int32 requestId) {
+        RPCMessage reply = {};
+        reply.id = requestId;
+        reply.response = response ? response.toString() : null;
+        StringWriter backing = {};
+        SerialWriter sw = {backing};
+        sw.write(reply.toString());
+        comm.write(backing.string());
+        log.debug I`sent to poller thread: $(reply.toString().getRepr())`;
+    }
+
+    void writeError(Connection comm, String errorMessage, int32 requestId) {
+        RPCMessage reply = {};
+        reply.id = requestId;
+        reply.error = errorMessage;
+        StringWriter backing = {};
+        SerialWriter sw = {backing};
+        sw.write(reply.toString());
+        comm.write(backing.string());
+        log.debug I`sent to poller thread: $(reply.toString().getRepr())`;
+    }
+}
+
+# Mapping from method name to method processing function.  In addition to a
+# context, a method handler accepts a string containing the serialized request
+# and an AppendBuffer into which to write the serialized response.
+alias _FuncWrapper = Functor3[void, Context, RPCMessage, Connection].Wrap;
+class MethodHandler : _FuncWrapper {
+
+    ## Set to true if authentication isn't required.
+    bool noauth;
+
+    oper init(function[void, Context, RPCMessage, Connection] func) :
+        _FuncWrapper(func) {
+    }
+
+    oper init(function[void, Context, RPCMessage, Connection] func,
+              bool noauth) :
+        _FuncWrapper(func),
+        noauth = noauth {
+    }
+}
+alias MethodMap = HashMap[String, MethodHandler];
+@export_symbols MethodMap;
+
+## TODO: make this abstract as soon as the bug in crack prohibiting an
+## appendage on an abstract class is fixed.
+class _PeerProxyBase {
+    void _invalidateProxy() {}
+}
+
+## Handles communication from an RPC client.
+class RPCHandler @impl UserHandler {
+
+    ## Serial reader for input.
+    _BufferSerialReader reader;
+
+    ## The session context.
+    Context __context;
+
+    Address __clientAddr;
+    MethodMap __methods;
+    HashMap[int, ResultHandler] __waiters = {};
+    RawPtr[_PeerProxyBase] __owner;
+
+    ## methods is nullable
+    oper init(MethodMap methods, Context context, Address clientAddr) :
+        __methods = methods,
+        __context = context,
+        __clientAddr = clientAddr {
+    }
+
+    void processRequest(Connection comm, RPCMessage msg) {
+        comm.log.debug `processing method $(msg.method)`;
+        String error;
+
+        handler := __methods.get(msg.method);
+        if (handler) {
+            try {
+                comm.log.debug `calling handler for $(msg.method)`;
+                if (!__context.authenticated && !handler.noauth) {
+                    comm.log.error I`Access denied to method $(msg.method): \
+                                     requires auth`;
+                    error = FStr() I`Access denied, auth required.`;
+                } else {
+                    handler(__context, msg, comm);
+                    return;
+                }
+            } catch (Exception ex) {
+                error = FStr() `$ex`;
+            }
+        } else {
+            comm.log.error `got unknown method $(msg.method)`;
+            error = FStr() `Method $(msg.method.getRepr()) not found`;
+        }
+
+        # if we haven't returned yet, we have to deal with an error.
+
+        # If there's no message id, the message is asynchronous and we don't
+        # return a response.
+        if (!msg.id)
+            return;
+
+
+        # Wrap the reply in a string and ship it back to the client.
+        comm.log.debug I`sending reply, error $error`;
+        __context.writeError(comm, error, msg.id);
+    }
+
+    void process(Connection comm) {
+        # Initialize the reader if we haven't done so.
+        if (!reader)
+            reader = _BufferSerialReader(comm.inBuf);
+        if (!__context.log) {
+            __context.log = comm.log;
+            if (ssl := SSLConnection.get(comm)) {
+                __context.authenticated = !(ssl.getUserData(0) is null);
+
+                # Only allow unauthenticated SSL connections over localhost.
+                if (!__context.authenticated &&
+                    (!(inaddr := InetAddress.cast(__clientAddr, null)) ||
+                     inaddr.getAddr() != 0x7f000001
+                     )
+                    ) {
+                    comm.log.error I`Unauthenticated SSL connection from \
+                                     remote client: $__clientAddr`;
+                    comm.close();
+                    return;
+                }
+            }
+        }
+
+        while (comm.inBuf) {
+            # Get the next message, make sure we were able to read it.
+            serializedMsg := reader.readString();
+            if (!serializedMsg)
+                # Assume this is an incomplete message.
+                return;
+
+            # We've got a complete message, so process it.
+            RPCMessage msg = {};
+            readMessageFromString(msg, serializedMsg);
+
+            if (msg.method) {
+                if (!__methods) {
+                    comm.log.error `conection attempted to send a request`;
+                    __context.writeError(comm,
+                                         'Non-peer cannot process requests',
+                                         msg.id
+                                         );
+                    continue;
+                }
+                processRequest(comm, msg);
+            } else {
+                # Treat it as a response.
+                waiter := __waiters.get(msg.id);
+                if (waiter)
+                    waiter.setResponse(msg);
+                else
+                    comm.log.error
+                        `No response found for message id $(msg.id)\n`;
+            }
+        }
+    }
+
+    void terminate(Connection comm) {
+        if (__owner)
+            __owner._invalidateProxy();
+
+        # Close all of the open connections.
+        for (waiter :in __waiters) {
+            RPCMessage response = {};
+            response.id = int32(waiter.key);
+            response.error = 'Connection closed prematurely.';
+            waiter.val.setResponse(response);
+        }
+    }
+
+    void addResponder(Object waiter) {
+        w := ResultHandler.cast(waiter);
+        __waiters[w.getInfo()] = w;
+    }
+
+    void disown() { __owner = null }
+    void setOwner(RawPtr[_PeerProxyBase] owner) { __owner = owner }
+}
+
+## Thrown whenever we receive an error from the remote object.
+class RemoteError : Exception {
+    oper init(String message) : Exception(message) {}
+}
+
+## An InetAddress extended that retains its hostname (or IP address, if
+## created that way).
+class ExtendedAddress : InetAddress {
+    String __hostname;
+
+    ## True if this is an SSL address.
+    bool ssl;
+
+    oper init(String hostname, byte a, byte b, byte c, byte d, int port,
+              bool ssl
+              ) :
+        InetAddress(a, b, c, d, port),
+        __hostname = hostname,
+        ssl = ssl {
+    }
+
+    oper init(String hostname, uint32 addr, int port, bool ssl) :
+        InetAddress(addr, port),
+        __hostname = hostname,
+        ssl = ssl {
+    }
+
+    String getHostname() { return __hostname }
+}
+
+## Parse an address of the form host:port.  "host" may be either a hostname or
+## an ip address.
+## Returns null if the address is not resolvable.
+ExtendedAddress parseAddr(String addr) {
+    int port;
+    String host;
+    bool ssl;
+    if ((colon := addr.lfind(b':')) != -1) {
+        host = addr.substr(0, colon);
+        port = parseInt(addr.substr(colon + 1));
+        colon = addr.lfind(b':', colon + 1);
+
+        # Check for an "ssl" designator.
+        if (colon != -1) {
+            proto := addr.substr(colon + 1);
+            if (proto == 'ssl')
+                ssl = true;
+            else if (proto != 'tcp')
+                throw InvalidArgumentError(
+                    FStr() `Invalid protocol "$proto": must be "ssl" or "tcp"`
+                );
+        }
+    } else {
+        host = addr;
+        port = DEFAULT_PORT;
+    }
+
+    # Now check for an ipv4 address.
+    ExtendedAddress a;
+    if (m := IPV4_ADDR.match(host)) {
+        a = ExtendedAddress(host, byte(parseInt(m.group(1))),
+                            byte(parseInt(m.group(2))),
+                            byte(parseInt(m.group(3))),
+                            byte(parseInt(m.group(4))),
+                            port,
+                            ssl
+                            );
+    } else {
+        addrs := resolve(host);
+        if (!addrs)
+            return null;
+        a = ExtendedAddress(host, InetAddress.cast(addrs[0]).getAddr(), port,
+                            ssl
+                            );
+    }
+    return a;
+}
+
+## Manages a single connection to a peer.  Remains valid (true) as long as
+## the peer is connected.  Does not automatically reconnect.
+class PeerProxy : _PeerProxyBase {
+    Connection __proxy;
+    Context __ctx;
+    Log __log;
+    int32 __lastId;
+    SSLContext __sslCtx;
+
+    void _invalidateProxy() {
+        __proxy = null;
+    }
+
+    RPCHandler __handler;
+
+    ## sslCtx: nullable.  If present, use SSL.
+    oper init(Context context, Connection proxy,
+              RPCHandler handler
+              ) :
+        __ctx = context,
+        __log = context.log,
+        __proxy = proxy,
+        __handler = handler {
+    }
+
+    oper del() {
+        if (__handler) __handler.disown();
+    }
+
+    ## A proxy is false if it is disconnected.
+    bool isTrue() {
+        return __proxy;
+    }
+
+    @static
+    PeerProxy __makeConnection(Comm comm, Log log, Address addr,
+                               SSLContext sslCtx,
+                               MethodMap methods,
+                               RawChunkReader reader
+                               ) {
+        log.info `connecting to $addr:$(sslCtx ? 'ssl' : 'tcp')`;
+        try {
+            context := Context(log);
+            context.reader = reader;
+            handler := RPCHandler(methods, context, addr);
+            proxy := sslCtx ? sslCtx.connect(addr, handler) :
+                              comm.connect(addr, handler);
+            result := PeerProxy(context, proxy, handler);
+            handler.setOwner(RawPtr[_PeerProxyBase](result));
+            return result;
+        } catch (Exception ex) {
+            log.warn `Unable to connect to $addr: $(ex.text)`;
+            return null;
+        }
+    }
+
+    @static
+    PeerProxy make(Comm comm, Log log, String addr, SSLContext sslCtx,
+                   MethodMap methods,
+                   RawChunkReader reader
+                   ) {
+        a := parseAddr(addr);
+        return __makeConnection(comm, log, a, sslCtx, methods, reader);
+    }
+
+    @static
+    PeerProxy make(Comm comm, Log log, Address addr, SSLContext sslCtx,
+                   MethodMap methods,
+                   RawChunkReader reader
+                   ) {
+        return __makeConnection(comm, log, addr, sslCtx, methods, reader);
+    }
+
+    @static
+    PeerProxy make(Comm comm, Log log, String addr, SSLContext sslCtx) {
+        return make(comm, log, addr, sslCtx, null, null);
+    }
+
+    @static
+    PeerProxy make(Comm comm, Log log, Address addr, SSLContext sslCtx) {
+        return make(comm, log, addr, sslCtx, null, null);
+    }
+
+    ## Test constructor.
+    class TestOnly {}
+    oper init(TestOnly test) {}
+
+    String __serialize(RPCMessage message) {
+        StringWriter out = {};
+        SerialWriter sw = {out};
+        sw.write(message.toString());
+        return out.string();
+    }
+
+    RPCMessage __sendSync(RPCMessage message) {
+        if (!__proxy)
+            throw PeerDisconnectedError();
+        # Serialize and send the message.
+        serialized := __serialize(message);
+        waiter := RPCWaiter(message.id);
+        __proxy.sendSync(serialized, waiter);
+        return waiter.getResult();
+    }
+
+    ## Invoke a remote method.
+    String __invoke(String method, String contents) {
+        RPCMessage msg = {};
+        msg.id = ++__lastId;
+        msg.method = method;
+        msg.request = contents;
+        resp := __sendSync(msg);
+
+        if (resp.error) {
+            throw RemoteError(resp.error);
+        }
+
+        return resp.response;
+    }
+
+    void __sendAsync(RPCMessage message, RPCCallback callback) {
+        if (!__proxy)
+            throw PeerDisconnectedError();
+        # Serialize and send the message.
+        serialized := __serialize(message);
+        __proxy.sendSync(serialized, callback);
+    }
+
+    void __invokeAsync(String method, String contents,
+                       RPCCallback callback
+                       ) {
+        RPCMessage msg = {};
+        callback.info = msg.id = ++__lastId;
+        msg.method = method;
+        msg.request = contents;
+        __sendAsync(msg, callback);
+    }
+
+    ## Shutdown the proxy connection.
+    void shutdown() {
+        if (__proxy)
+            __proxy.close();
+    }
+
+    ## Returns the object with the specified digest, null if the peer doesn't
+    ## have it.
+    String getObject(String digest) {
+        GetObjectRequest req = {};
+        req.digest = digest;
+        GetObjectResponse resp = {};
+        respData := __invoke('getObject', req.toString());
+        readMessageFromString(resp, respData);
+        return resp.data;
+    }
+
+    String getHead(String branch) {
+        GetHeadRequest req = {};
+        req.branch = branch;
+        GetHeadResponse resp = {};
+        respData := __invoke('getHead', req.toString());
+        readMessageFromString(resp, respData);
+        return resp.digest;
+    }
+
+    ## Get a file from the remote backing store.
+    ##
+    ## This method can probably subsume getObject() and getHead().
+    String getFile(String filename) {
+        GetFileRequest req = {};
+        req.filename = filename;
+        GetFileResponse resp = {};
+        respData := __invoke('getFile', req.toString());
+        readMessageFromString(resp, respData);
+        return resp.data;
+    }
+
+    ## Gets the next journal block from the remote peer.  See RawChunkReader
+    ## for details.
+    JournalBlock getJournalBlock(String firstBlockDigest,
+                                 String branch,
+                                 uint pos
+                                 ) {
+        GetJournalBlockRequest req = {};
+        GetJournalBlockResponse resp = {};
+        req.firstBlockDigest = firstBlockDigest;
+        req.branch = branch;
+        req.pos = int32(pos);
+        respData := __invoke('getJournalBlock', req.toString());
+        readMessageFromString(resp, respData);
+        return JournalBlock(resp.firstBlockDigest, resp.contents, resp.done);
+    }
+
+    ## Pull the specified branch from the specified peer or from any peer in
+    ## the network if 'peer' is null.
+    ## Returns the local name of the branch.
+    String pullBranch(String branch, String peer) {
+        PullBranchRequest req = {};
+        PullBranchResponse resp = {};
+        req.branch = branch;
+        req.peer = peer;
+        respData := __invoke('pullBranch', req.toString());
+        readMessageFromString(resp, respData);
+        return resp.localName;
+    }
+
+    ## Notifies another peer to pull the branch from this peer.  Does not
+    ## block, invokes 'callback' when done.
+    void pullBranchFromMe(String branch, GeneralCallback[String] callback) {
+        PullBranchRequest req = {};
+        req.branch = branch;
+        req.fromClient = true;
+
+        class Callback : RPCCallback {
+            @cvars {
+                GeneralCallback[String] callback;
+            }
+
+            void setResponse(RPCMessage result) {
+                PullBranchResponse resp = {};
+                if (result.error) {
+                    callback(null, Exception(result.error));
+                } else {
+                    @assert(result.response);
+                    readMessageFromString(resp, result.response);
+                    callback(resp.localName, null);
+                }
+            }
+        }
+
+        __invokeAsync('pullBranch', req.toString(), Callback(callback));
+    }
+
+    ## Push the specified branch to the peer.
+    ##
+    ## Returns the local name that the peer chose for the branch.
+    ##
+    ## traverse: one of the TRAVERSE_* constants below.
+    String pushBranch(String branch, String peer, int traverse) {
+        PullBranchRequest req = {};
+        PullBranchResponse resp = {};
+        req.branch = branch;
+        req.peer = peer;
+        if (traverse != TRAVERSE_NONE)
+            # Omit this if it's NONE
+            req.traverse = int32(traverse + 1);
+        respData := __invoke('pushBranch', req.toString());
+        readMessageFromString(resp, respData);
+        return resp.localName
+    }
+
+    ## Initiates a merge of the active branch with the specified merge branch.
+    MergeResponse merge(String branch) {
+        MergeRequest req = {};
+        MergeResponse resp = {};
+        req.branch = branch;
+        respData := __invoke('merge', req.toString());
+        readMessageFromString(resp, respData);
+        return MergeResult(resp.mergeBranch, resp.commit, resp.conflict);
+    }
+
+    ## Resolve a merge that is outstanding due to conflicts.
+    void resolve() {
+        __invoke('resolve', null);
+    }
+
+    ## Cancel a pending merge.
+    void cancelMerge() {
+        __invoke('cancelMerge', null);
+    }
+
+    ## Add a new peer to the instance.  The peer will not be propagated
+    ## through the network.
+    void addPeer(String peerName, String peerAddr) {
+        req := AddPeerRequest();
+        req.peerName = peerName;
+        req.peerAddr = peerAddr;
+        __invoke('addPeer', req.toString());
+    }
+
+    ## Get information about the instance.
+    InfoResponse getInfo() {
+        respData := __invoke('getInfo', '');
+        InfoResponse result = {};
+        readMessageFromString(result, respData);
+        return result;
+    }
+
+    ## Traverse all nodes in branch.  See TRAVERSE_* constants above.
+    void traverse(String branch, int algo) {
+        req := TraverseRequest();
+        req.branch = branch;
+        req.algo = int32(algo);
+        __invoke('traverse', req.toString());
+    }
+
+    ## Asynchronous call to traverse.
+    ##
+    ## 'branch' is passed back to the client through the callback, this is
+    ## expedient given the way this is used (as the second stage in the "push"
+    ## process).
+    void traverseAsync(String branch, int algo,
+                       GeneralCallback[String] callback
+                       ) {
+        req := TraverseRequest();
+        req.branch = branch;
+        req.algo = int32(algo);
+
+        class Callback : RPCCallback {
+            @cvars {
+                String branch;
+                GeneralCallback[String] clientCallback;
+            }
+
+            void setResponse(RPCMessage result) {
+                # No response content for traverse requests.
+                clientCallback(branch, null);
+            }
+        }
+
+        __invokeAsync('traverse', req.toString(), Callback(branch, callback));
+    }
+
+    ## Get the current mountpoint (a subset of getInfo()).
+    String getMountpoint() {
+        respData := __invoke('getMountpoint', '');
+        InfoResponse result = {};
+        readMessageFromString(result, respData);
+        return result.mountpoint;
+    }
+
+    ## Login to the instance as a peer.  This does the complete handshake
+    ## required to do login.
+    ## 'cipher' must be the current instance cipher.
+    ##
+    ## After this is called, the peer is listed as authenticated, meaning that
+    ## if a method table was provided during construction, the peer can call
+    ## authenticated methods.
+    void login(Cipher cipher) {
+        req := LoginRequest();
+        challenge := getEntropySource().getString(32);
+        req.challenge = cipher.encrypt(challenge);
+        respData := __invoke('login', req.toString());
+        LoginResponse resp = {};
+        readMessageFromString(resp, respData);
+        if (resp.error)
+            throw LoginError(resp.error);
+
+        # If we get here, we passed the first phase.  Verify the response.
+        if (cipher.decrypt(resp.response) != sha256(challenge)) {
+            __log.error `Invalid response from login`;
+            throw LoginError('Invalid response received from peer.');
+        }
+
+        ## Send back a response to the peer's challenge.
+        req.challenge = null;
+        req.response = cipher.encrypt(sha256(cipher.decrypt(resp.challenge)));
+        respData = __invoke('login', req.toString());
+        readMessageFromString(resp, respData);
+        if (resp.error)
+            throw LoginError(resp.error);
+        __ctx.authenticated = true;
+    }
+
+    ## Login from a user agent with access to the mounted filesystem.  The
+    ## 'nonce' comes from the contents of the .mawfs/otp file.
+    ##
+    ## Note that 'nonce' is not sent encrypted: this should not be used to
+    ## login to a remote system on an unencrypted connection, otherwise the
+    ## connection could be MITMed.
+    ##
+    ## This method does not authenticate the peer as login(Cipher) does, for
+    ## one thing it's not important to do so since this method is called in
+    ## local client mode, for another it's not clear that a nonce and a
+    ## connection provide a strong enough form of authentication.
+    void login(String nonce) {
+        req := LoginRequest();
+        req.nonce = nonce;
+        respData := __invoke('login', req.toString());
+        resp := LoginResponse();
+        readMessageFromString(resp, respData);
+        if (resp.error)
+            throw LoginError(resp.error);
+    }
+
+    ## Notify the server that we are connecting as a peer that can receive
+    ## RPCs.
+    void peerConnected(String peerName) {
+        req := PeerConnectedRequest();
+        req.peerName = peerName;
+        __invoke('peerConnected', req.toString());
+    }
+
+    ## Returns the deccrypted commit object.
+    ##
+    ## commitIdOrTag is either an alt-base64 encoded commit id or a branch tag.
+    CommitAndDigest getCommit(String commitIdOrTag) {
+        req := GetCommitRequest();
+        req.commitOrTag = commitIdOrTag;
+        result := CommitAndDigest();
+        respData := __invoke('getCommit', req.toString());
+        readMessageFromString(result, respData);
+        return result;
+    }
+
+    ## Perform a commit with the given metadata (which may be null).
+    ## User-provided fields in metadata will be stored in the final commit,
+    ## other fields are ignored.
+    void commit(CommitMetadata metadata) {
+        req := CommitRequest();
+        req.metadata = metadata;
+        __invoke('commit', req.toString());
+    }
+
+    ## Sets the "authenticated" flag on the local client context.  This allows
+    ## the remote peer to invoke methods back to this instance if a method
+    ## table was provided.
+    ##
+    ## In most cases, it shouldn't be necessary to call this.  On client side
+    ## the flag is set after a successful peer login, on the server side it is
+    ## set upon authentication (either from a login or implicitly through the
+    ## SSL connection).
+    void setAuthenticated(bool authenticated) {
+        __ctx.authenticated = authenticated;
+    }
+}
+
+# --- Server-side method implementation functions. ---
+
+void getObject(Context context, RPCMessage msg, Connection comm) {
+    GetObjectRequest req = {};
+    readMessageFromString(req, msg.request);
+
+    class ResponseCallback @impl GeneralCallback[String] {
+        @cvars {Context context; Connection comm; int32 requestId;}
+        void oper call(String contents, Exception ex) {
+            GetObjectResponse resp = {};
+            resp.data = contents;
+            context.writeResponse(comm, resp, requestId);
+        }
+    }
+
+    context.reader.readRawChunk(req.digest,
+                                ResponseCallback(context, comm, msg.id));
+}
+
+void getHead(Context context, RPCMessage msg, Connection comm) {
+    GetHeadRequest req = {};
+    readMessageFromString(req, msg.request);
+
+    class ResponseCallback @impl GeneralCallback[String] {
+        @cvars {Context context; Connection comm; int32 requestId;}
+        void oper call(String digest, Exception ex) {
+            GetHeadResponse resp = {};
+            resp.digest = digest;
+            context.writeResponse(comm, resp, requestId);
+        }
+    }
+
+    context.reader.getHead(req.branch, ResponseCallback(context, comm, msg.id));
+}
+
+void getFile(Context context, RPCMessage msg, Connection comm) {
+    GetFileRequest req = {};
+    readMessageFromString(req, msg.request);
+
+    class ResponseCallback @impl GeneralCallback[String] {
+        @cvars {Context context; Connection comm; int32 requestId;}
+        void oper call(String data, Exception ex) {
+            GetFileResponse resp = {};
+            resp.data = data;
+            context.writeResponse(comm, resp, requestId);
+        }
+    }
+
+    context.reader.getFile(req.filename,
+                           ResponseCallback(context, comm, msg.id));
+}
+
+void getJournalBlock(Context context, RPCMessage msg, Connection comm) {
+    GetJournalBlockRequest req = {};
+    readMessageFromString(req, msg.request);
+
+    class ResponseCallback @impl GeneralCallback[JournalBlock] {
+        @cvars {Context context; Connection comm; int32 requestId;}
+        void oper call(JournalBlock block, Exception ex) {
+            GetJournalBlockResponse resp = {};
+            resp.firstBlockDigest = block.firstBlockDigest;
+            resp.contents = block.contents;
+            resp.done = block.done;
+            context.writeResponse(comm, resp, requestId);
+        }
+    }
+
+    context.reader.getJournalBlock(req.firstBlockDigest, req.branch, req.pos,
+                                   ResponseCallback(context, comm, msg.id)
+                                   );
+}
+
+void pullBranch(Context context, RPCMessage msg, Connection comm) {
+    PullBranchRequest req = {};
+    readMessageFromString(req, msg.request);
+
+    class ResponseCallback @impl GeneralCallback[String] {
+        @cvars {Context context; Connection comm; int32 requestId;}
+        void oper call(String localName, Exception ex) {
+            # Pull-branch is handled asynchronously, so we have to check
+            # the 'ex' argument.
+            if (ex) {
+                context.writeError(comm,
+                                   ex.text ? ex.text : String(ex.class.name),
+                                   requestId);
+            } else {
+                PullBranchResponse resp = {};
+                resp.localName = localName;
+                context.writeResponse(comm, resp, requestId);
+            }
+        }
+    }
+
+    String peerName = req.peer;
+    if (req.fromClient) {
+        if (!context.peerName) {
+            context.writeError(comm,
+                               'pullBranch with fromClient may only be '
+                               'called from another peer',
+                               msg.id
+                               );
+            return;
+        }
+
+        peerName = context.peerName;
+    }
+
+    context.inst.pullBranch(req.branch, peerName,
+                            ResponseCallback(context, comm, msg.id));
+}
+
+void pushBranch(Context context, RPCMessage msg, Connection comm) {
+    PullBranchRequest req = {};
+    readMessageFromString(req, msg.request);
+
+    class ResponseCallback @impl GeneralCallback[String] {
+        @cvars {Context context; Connection comm; int32 requestId;}
+        void oper call(String localName, Exception ex) {
+            if (ex) {
+                context.writeError(comm,
+                                   ex.text ? ex.text : String(ex.class.name),
+                                   requestId);
+            } else {
+                PullBranchResponse resp = {};
+                resp.localName = localName;
+                context.writeResponse(comm, resp, requestId);
+            }
+        }
+    }
+
+    context.inst.pushBranch(req.branch, req.peer, req.traverse - 1,
+                            ResponseCallback(context, comm, msg.id));
+}
+
+void merge(Context context, RPCMessage msg, Connection comm) {
+    MergeRequest req = {};
+    readMessageFromString(req, msg.request);
+
+    class ResponseCallback @impl GeneralCallback[MergeResponse] {
+        @cvars {Context context; Connection comm; int32 requestId;}
+        void oper call(MergeResponse resp, Exception ex) {
+            # merge is handled asynchronously, so we have to check
+            # the 'ex' argument.
+            if (ex) {
+                context.writeError(comm, ex.text, requestId);
+            } else {
+                context.writeResponse(comm, resp, requestId);
+            }
+        }
+    }
+
+    context.inst.merge(req.branch, ResponseCallback(context, comm, msg.id));
+}
+
+## Callback that can be used for RPCs that don't have a meaningful return
+## value.
+class EmptyResponseCallback @impl GeneralCallback[int] {
+    @cvars {Context context; Connection comm; int32 requestId;}
+    void oper call(int resp, Exception ex) {
+        if (ex) {
+            context.writeError(comm, ex.text, requestId);
+        } else {
+            context.writeResponse(comm, null, requestId);
+        }
+    }
+}
+
+void resolve(Context context, RPCMessage msg, Connection comm) {
+    context.inst.resolve(EmptyResponseCallback(context, comm, msg.id));
+}
+
+void cancelMerge(Context context, RPCMessage msg, Connection comm) {
+    context.inst.cancelMerge(EmptyResponseCallback(context, comm, msg.id));
+}
+
+void addPeer(Context context, RPCMessage msg, Connection comm) {
+    req := AddPeerRequest();
+    readMessageFromString(req, msg.request);
+
+    context.inst.addPeer(req.peerName, req.peerAddr,
+                  EmptyResponseCallback(context, comm, msg.id)
+                  );
+}
+
+void getInfo(Context context, RPCMessage msg, Connection comm) {
+    try {
+        info := context.inst.getInfo();
+        context.writeResponse(comm, info, msg.id);
+    } catch (Exception ex) {
+        context.writeError(comm, ex.text, msg.id);
+    }
+}
+
+void getMountpoint(Context context, RPCMessage msg, Connection comm) {
+    try {
+        info := context.inst.getInfo();
+        resp := InfoResponse();
+        resp.mountpoint = info.mountpoint;
+        context.writeResponse(comm, resp, msg.id);
+    } catch (Exception ex) {
+        context.writeError(comm, ex.text, msg.id);
+    }
+}
+
+void traverse(Context context, RPCMessage msg, Connection comm) {
+    req := TraverseRequest();
+    readMessageFromString(req, msg.request);
+    context.inst.traverse(req.branch, req.algo,
+                   EmptyResponseCallback(context, comm, msg.id)
+                   );
+}
+
+void login(Context context, RPCMessage msg, Connection comm) {
+    req := LoginRequest();
+    readMessageFromString(req, msg.request);
+    try {
+        if (req.challenge) {
+            # Phase 1 request, p2p challenge.  Write response, send our own
+            # challenge.
+            context.loginState = context.inst.answerChallenge(req.challenge);
+            resp := LoginResponse();
+            resp.response = context.loginState.response;
+            resp.challenge = context.loginState.challenge;
+            context.writeResponse(comm, resp, msg.id);
+            return;
+        } else if (req.response) {
+            # Phase 2 request, p2p reaponse.  Verify response to our challenge.
+            if (!context.loginState)
+                throw LoginError('Response received before challenge!');
+            if (!context.loginState.verifyResponse(req.response))
+                throw LoginError('Incorrect login response.');
+        } else if (req.nonce) {
+            # Client side nonce verification.  Just verify the nonce.
+            if (!context.inst.validNonce(req.nonce))
+                throw LoginError('Invalid nonce.');
+        } else {
+            throw LoginError('Invalid login request.');
+        }
+    } catch (LoginError ex) {
+        resp := LoginResponse();
+        resp.error = ex.text;
+        context.writeResponse(comm, resp, msg.id);
+        return;
+    }
+
+    context.authenticated = true;
+    context.writeResponse(comm, LoginResponse(), msg.id);
+}
+
+void peerConnected(Context context, RPCMessage msg, Connection conn) {
+    req := PeerConnectedRequest();
+    readMessageFromString(req, msg.request);
+
+    # Wrap the connection in a new peer proxy.
+    handler := RPCHandler.cast(conn.userHandler);
+    proxy := PeerProxy(context, conn, handler);
+    handler.setOwner(RawPtr[_PeerProxyBase](proxy));
+
+    context.peerName = req.peerName;
+    context.inst.peerConnected(req.peerName, proxy);
+    context.writeResponse(conn, null, msg.id);
+}
+
+void getCommit(Context context, RPCMessage msg, Connection conn) {
+    req := GetCommitRequest();
+    readMessageFromString(req, msg.request);
+
+    class ResponseCallback @impl GeneralCallback[CommitAndDigest] {
+        @cvars {Context context; Connection conn; int32 requestId;}
+        void oper call(CommitAndDigest result, Exception ex) {
+            if (result)
+                context.writeResponse(conn, result, requestId);
+            else if (ex)
+                context.writeError(conn,
+                                   FStr() `$(ex.class.name): $(ex.text)`,
+                                   requestId
+                                   );
+            else
+                context.writeError(conn, 'chunk not found', requestId);
+        }
+    }
+
+    context.inst.getCommit(req.commitOrTag,
+                           ResponseCallback(context, conn, msg.id));
+}
+
+void commit(Context context, RPCMessage msg, Connection conn) {
+    req := CommitRequest();
+    readMessageFromString(req, msg.request);
+    context.inst.commit(req.metadata,
+                        EmptyResponseCallback(context, conn, msg.id)
+                        );
+}
+
+const METHODS := MethodMap();
+METHODS['getObject'] = MethodHandler(getObject);
+METHODS['getHead'] = MethodHandler(getHead);
+METHODS['getJournalBlock'] = MethodHandler(getJournalBlock);
+METHODS['getFile'] = MethodHandler(getFile);
+METHODS['pullBranch'] = MethodHandler(pullBranch);
+METHODS['merge'] = MethodHandler(merge);
+METHODS['resolve'] = MethodHandler(resolve);
+METHODS['cancelMerge'] = MethodHandler(cancelMerge);
+METHODS['addPeer'] = MethodHandler(addPeer);
+METHODS['getInfo'] = MethodHandler(getInfo);
+METHODS['traverse'] = MethodHandler(traverse);
+METHODS['peerConnected'] = MethodHandler(peerConnected);
+METHODS['getCommit'] = MethodHandler(getCommit);
+METHODS['commit'] = MethodHandler(commit);
+METHODS['pushBranch'] = MethodHandler(pushBranch);
+METHODS['getMountpoint'] = MethodHandler(getMountpoint, true);
+METHODS['login'] = MethodHandler(login, true);
+
+class PeerServiceConnectionFactory @impl ConnectionFactory {
+    RawChunkReader __chunkReader;
+    InstIFace __inst;
+
+    oper init(RawChunkReader chunkReader, InstIFace inst) :
+        __chunkReader = chunkReader,
+        __inst = inst {
+    }
+
+    Connection makeConnection(NewConnection conn) {
+        conn.log.info `accepted connection from $(conn.accepted.addr)\n`;
+        log := Log(conn.log, FStr() `server-client-$(conn.accepted.addr)`);
+        return Connection(log,
+                          RPCHandler(METHODS, Context(__chunkReader, __inst),
+                                     conn.accepted.addr
+                                     )
+                          );
+    }
+}

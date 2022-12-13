@@ -1,0 +1,182 @@
+
+import crack.cont.hashmap HashMap;
+import mawfs.blockstore ChunkSet, Commit, Entry, Node;
+import mawfs.cache NodeContext, Tree;
+import mawfs.memstore MemNodeStore;
+import mawfs.util findCommonAncestor, findCommonCommit, traverseCommit;
+import test.repoutil RepoTest;
+import test.unittest register, runAllTests, Test;
+
+@import crack.ann assert, impl;
+
+## Commit builder.
+class CB {
+    Commit __rep = {};
+
+    void append(String parent) { __rep.parent_append(parent) }
+    CB root(String rootDigest) {
+        __rep.root = rootDigest;
+        return this;
+    }
+    Commit build() { return __rep }
+}
+
+@abstract class CommitTest : Test {
+    MemNodeStore store = {};
+}
+
+class CommonCommitSimple : CommitTest {
+    void run() {
+        root := store.storeCommit(Commit());
+        common := store.storeCommit(CB![root].build());
+
+        # We need to specify roots for these, otherwise they are the same
+        # commit!
+        a := store.storeCommit(CB![common].root('xxx').build());
+        b := store.storeCommit(CB![common].root('yyy').build());
+        assertEqual(findCommonCommit(store, a, b), common);
+
+        assertEqual(findCommonCommit(store, a, common), common);
+        assertEqual(findCommonCommit(store, common, b), common);
+        assertEqual(findCommonCommit(store, common, common), common);
+    }
+}
+register(CommonCommitSimple());
+
+class CommonCommitForked : CommitTest {
+    void run() {
+        root := store.storeCommit(Commit());
+        common := store.storeCommit(CB![root].build());
+        a := store.storeCommit(CB![common].root('xxx').build());
+
+        b := store.storeCommit(CB![common].root('yyy').build());
+        c := store.storeCommit(CB![b].build());
+        d := store.storeCommit(CB![c].build());
+        e := store.storeCommit(CB![b].build());
+        f := store.storeCommit(CB![e, c].build());
+
+        assertEqual(findCommonCommit(store, a, f), common);
+        assertEqual(findCommonCommit(store, f, a), common);
+    }
+}
+register(CommonCommitForked());
+
+class NoCommonAncestor : CommitTest {
+    void run() {
+        root1 := store.storeCommit(CB().root('xxx').build());
+        root2 := store.storeCommit(CB().root('yyy').build());
+        assertEqual(findCommonCommit(store, root1, root2), null);
+    }
+}
+register(NoCommonAncestor());
+
+class CommonAncestorTest : RepoTest {
+    void run() {
+        ctx := NodeContext(store, 'master', commitDigest);
+
+        # We do the easy thing here and just verify that this works for
+        # commits.  The other scenarios should be tested above.
+        t0 := Tree(store, 'master');
+        root0 := t0.getRoot();
+        root0.addChild('first', makeFile(ctx, 'first'), 0);
+        t0.commit();
+
+        # Fork the other branch, before any other changes.
+        store.setHead('other', store.getHead('master'));
+
+        t1 := Tree(store, 'master');
+        root1 := t1.getRoot();
+        root1.addChild('foo', makeFile(ctx, 'foo'), 0);
+        t1.commit();
+
+        # Duplicate this branch into another.
+        t2 := Tree(store, 'other');
+        root2 := t2.getRoot();
+        root2.addChild('bar', makeFile(ctx, 'bar'), 0);
+        t2.commit();
+
+        @import crack.ann assert;
+        @assert(!root1.isDirty());
+        @assert(!root2.isDirty());
+        assertEqual(findCommonAncestor(root1, root2), root0);
+    }
+}
+register(CommonAncestorTest());
+
+class MemChunkSet @impl ChunkSet {
+    HashMap[String, bool] __map = {};
+    void add(String digest) {
+        __map[digest] = true;
+    }
+
+    bool has(String digest) {
+        return __map.get(digest, false);
+    }
+
+    int count() { return __map.count() }
+}
+
+class TrackingNodeStore : MemNodeStore {
+    HashMap[String, bool] pulled = {};
+    MemChunkSet __traversed = {};
+
+    oper init(MemChunkSet traversed) : __traversed = traversed {}
+
+    Node getNode(String digest) {
+        pulled[digest] = true;
+        return MemNodeStore.getNode(digest);
+    }
+
+    Commit getCommit(String digest) {
+        pulled[digest] = true;
+        return MemNodeStore.getCommit(digest);
+    }
+
+    ChunkSet getTraversed() { return __traversed }
+}
+
+class TraversalTest : Test {
+    void run() {
+        traversed := MemChunkSet();
+        store := TrackingNodeStore(traversed);
+
+        # Store initial commit.
+        node := Node();
+        rootDigest := store.storeNode(node);
+        commitDigest := store.storeCommit(CB().root(rootDigest).build());
+
+        # Traverse it.
+        traverseCommit(store, commitDigest, store.getTraversed());
+
+        # Should have the node and the commit in the traversed set.
+        @assert(traversed.has(rootDigest));
+        @assert(traversed.has(commitDigest));
+        @assert(traversed.count() == 2);
+
+        # Add a new commit and node.
+        node = Node();
+        child := Entry();
+        child.hash = rootDigest;
+        node.children_append(child);
+        rootDigest = store.storeNode(node);
+        commitDigest = store.storeCommit(
+            CB![commitDigest].root(rootDigest).build()
+        );
+        store.pulled.clear();
+        traverseCommit(store, commitDigest, traversed);
+
+        # verify that we've only pulled the new chunks.
+        @assert(store.pulled.count() == 2);
+        @assert(store.pulled.hasKey(commitDigest));
+        @assert(store.pulled.hasKey(rootDigest));
+
+        # Verify that we've traversed all the chunks (we'll assume that the
+        # old ones are still there).
+        @assert(traversed.count() == 4);
+        @assert(traversed.has(commitDigest));
+        @assert(traversed.has(rootDigest));
+    }
+}
+register(TraversalTest());
+
+runAllTests();

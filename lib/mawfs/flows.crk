@@ -1,0 +1,766 @@
+## High-level workflows.
+
+import crack.cont.array Array;
+import crack.enc.base64 altDecode, altEncode;
+import crack.fs Path;
+import crack.functor Functor0;
+import crack.io FStr;
+import crack.lang Exception, InvalidArgumentError, InvalidResourceError;
+import crack.logger debug, error, info;
+import crack.rawptr RawPtr;
+import crack.threads Mutex, MutexLock, Queue, Thread;
+
+import .blockstore ChunkStore, Commit, CommitMetadata, JournalIter;
+import .cache Cache, NodeContext;
+import .ciphers sha256, Cipher;
+import .entropy getEntropySource;
+import .inst InstanceState;
+import .merge Merger, MergeState;
+import .nonces NONCE_SIZE;
+import .peernet PeerNetInstIFace, Peer, PeerNetwork;
+import .rawchunk GeneralCallback;
+import .rpc parseAddr, CommitAndDigest, InfoResponse, LoginError, LoginState,
+    MergeResult, MergeResponse, PeerProxy, PSKInfo, TRAVERSE_NONE,
+    TRAVERSE_DELTA, TRAVERSE_FULL;
+import .util findCommonAncestor, traverseCommit;
+
+@import crack.ann assert, cvars, define, impl;
+
+alias Task = Functor0[void];
+
+## The thread pool used to run flows. It's currently just a single thread.
+##
+## Use the submit() method to submit tasks for execution, submit a task that
+## evaluates to "false" to kill the thread.
+class ThreadPool {
+    Mutex __mutex = {};
+    Queue[Task] __queue = {};
+
+    class __Thread : Thread {
+        @cvars { Queue[Task] __queue; }
+
+        void run() {
+            info `Worker thread pool started.`;
+            while (task := __queue.get())
+                task();
+            info `Worker thread pool terminating.`;
+        }
+    }
+
+    __Thread __thread;
+
+    void __start() {
+        MutexLock lock = {__mutex};
+        if (!__thread) {
+            __thread = __Thread(__queue);
+            __thread.start();
+        }
+    }
+
+    ## Subit a task for execution.
+    void submit(Task task) {
+        __start();
+        __queue.add(task);
+        if (!task) {
+            lock := MutexLock(__mutex);
+            __thread = null;
+        }
+    }
+}
+
+ThreadPool __pool = {};
+
+@define task(vars, resultType, action) {
+    class MyTask @impl Task {
+        @cvars {
+            vars
+            GeneralCallback[resultType] callback;
+        }
+
+        void oper call() {
+            resultType result;
+            Exception exception;
+            try {
+                result = (action);
+            } catch (Exception ex) {
+                actionName := $action;
+                error `Got exception in task $actionName: $ex`;
+                exception = ex;
+            }
+            callback(result, exception);
+        }
+    }
+}
+
+import crack.io cerr;
+class MAWFSInstance : PeerNetInstIFace {
+    InstanceState __state;
+    RawPtr[PeerNetwork] __net;
+
+    oper init(InstanceState state) : __state = state {}
+
+    ## Set the PeerNetwork for the instance.  This _must_ be called prior to
+    ## the use of the instance.
+    void setPeerNetwork(PeerNetwork net) { __net = RawPtr[PeerNetwork](net) }
+
+    ## Returns true if the commit derives from the ancestor.
+    ##
+    ## TODO: Improve this algorithm.  We're just using a simple recursive
+    ## depth-first search for this, that's bound to be inefficient considering
+    ## the way branching is likely to play out.
+    ##
+    ## Requires a lock on the instance state.
+    bool __derivesFrom(String commitDigest, String ancestorDigest) {
+        if (commitDigest == ancestorDigest)
+            return true;
+
+        commit := __state.getStore().getCommit(commitDigest);
+        @assert(commit);
+        bool result;
+        if (commit.parent) {
+            for (parent :in commit.parent) {
+                if (__derivesFrom(parent, ancestorDigest))
+                    result = true;
+            }
+        }
+        return result;
+    }
+
+    ## If 'laterCommitDigest' derives from 'curCommitDigest', returns the
+    ## commit that derives directly from 'curCommitDigest'.  This may be the
+    ## later commit or it may be a commit that the later commit derives from.
+    ##
+    ## If the later commit does not derive from the current one, returns null.
+    ##
+    ## Requires a lock on the instance state.
+    Commit __getFollowingCommit(String curCommitDigest, String laterCommitDigest) {
+        commit := __state.getStore().getCommit(laterCommitDigest);
+        @assert(commit);
+        if (commit.parent) {
+            for (parent :in commit.parent) {
+                if (parent == curCommitDigest)
+                    return commit;
+                else if (c := __getFollowingCommit(curCommitDigest, parent))
+                    return c;
+            }
+        }
+        return null;
+    }
+
+    ## Returns true if the commit in 'head' includes all of the changes in
+    ## 'otherHead' and the journal 'otherJiter'.  This basically verifies that
+    ## head is derived from otherHead and all sessions in otherJiter are in
+    ## the commit following otherHead on the path to head.
+    ##
+    ## Assumes that 'otherJiter' is valid (not null).
+    bool __subsumes(String head, String otherHead, JournalIter otherJiter) {
+        following := __getFollowingCommit(otherHead, head);
+        import mawfs.cache sig;
+        if (!following || !following.journalInfo)
+            return false;
+
+        # We can get away with a 'null' branch name for this because we're
+        # just using the NodeContext to load the journal info for the branch.
+        nodeCtx := NodeContext(__state.getStore(), Cache(), /* name */ null);
+        sessionIds := nodeCtx.getJournalInfo(following.journalInfo);
+
+        # Verify that all sessions that are in the local journal
+        # are present in the following commit.
+        for (entry :in otherJiter) {
+            if (!sessionIds.get(entry.change.sessionId)) {
+                # There are changes in the local journal that
+                # aren't in the commit, so we have to branch.
+                info I`Unable to fast-forward pull of branch, missing
+                       session id $(entry.change.sessionId.getRepr())`;
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+
+    ## Helper function for __pullBranch, does everything but update the local
+    ## tree.
+    ##
+    ## Requires a lock on the instance state.
+    String __pullBranch(String name, String peer) {
+        backing := __state.getBacking();
+        store := __state.getStore();
+        localHead := store.getHead(name);
+
+        Peer peerObj;
+        if (peer) {
+            peerObj = __net.getPeer(peer);
+            if (!peerObj)
+                throw Exception(FStr() `Peer $peer does not exist.`);
+        }
+
+        # Pull the journal, either from the specified peer or from the peer
+        # network.  Use 'localHead' as the flag to determine if the branch
+        # name needs to be fully qualified (by the name of the peer), which is
+        # the case if there is a local journal for the branch.
+        String newName;
+        if (peerObj) {
+            newName = __net.pullJournal(backing, name, peerObj, localHead);
+        } else {
+            newName = __net.pullJournal(backing, name, localHead);
+            if (!newName)
+                throw Exception('No peer was able to supply the branch.');
+        }
+
+        jiter := store.makeJournalIter(newName);
+        if (!jiter) {
+            # 'supplier' is the name of the peer that actually supplied the
+            # branch, it will be either 'peer' or the first peer in the
+            # network that provided the branch.  'head' is simply the branch
+            # head.
+            String supplier, head;
+
+            # No journal.  Try pulling the commit.
+            if (peerObj) {
+                supplier = peer;
+                head = peerObj.getProxy().getHead(name);
+            } else {
+                headAndPeer := __net.getHead(name);
+                if (!headAndPeer)
+                    throw Exception('Unable to retrieve branch');
+                supplier = headAndPeer.peer;
+                head = headAndPeer.head;
+            }
+
+            # If our commit is derived from the remote commit, we're done.
+            if (localHead && __derivesFrom(localHead, head))
+                return name;
+
+            # If there is a local journal for the branch, check to see if the
+            # new commit includes all changes.
+            localJiter := store.makeJournalIter(name);
+            if (localJiter) {
+                # If the new commit subsumes the local journal, delete the
+                # local journal.
+                if (__subsumes(head, localHead, localJiter)) {
+                    (backing/'journals'/name).delete();
+                    newName = name;
+
+                # Otherwise make sure we've changed the name (even if there's
+                # no local journal).
+                } else if (name == newName) {
+                    newName = supplier + ':' + name;
+                }
+            } else if (localHead && __derivesFrom(head, localHead)) {
+                # There's no journals and the new head derives from the local
+                # head. We're going to want to store the new head and we can
+                # subsume the old branch.
+                newName = name;
+            }
+
+            store.setHead(newName, head);
+            return newName;
+        }
+        store.setHead(newName, newHead := jiter.elem().change.commit);
+
+        if (name == newName) {
+            return name;
+        } else {
+            # There was an existing branch, compare it to the new one.
+            localJiter := store.makeJournalIter(name);
+            if (!localJiter) {
+                # No local journal - we're done unless the new commit derives
+                # from the old one.  If that's true, fall through and we'll
+                # enter the logic for "a remote journal extending a local
+                # journal" below.
+                if (!__derivesFrom(newHead, localHead))
+                    return newName;
+            }
+
+            # If the two branches have different heads, check to see if one of
+            # the journals is entirely subsumed by the next commit.
+            if (newHead != localHead) {
+                if (__subsumes(newHead, localHead, localJiter)) {
+                    (backing/'journals'/newName).moveTo(backing/'journals'/name);
+                    (backing/'refs'/newName).moveTo(backing/'refs'/name);
+                    return name;
+                } else if (__subsumes(localHead, newHead, jiter)) {
+                    # The local head subsumes the new head.  Discard the new
+                    # branch.
+                    (backing/'journals'/newName).delete();
+                    (backing/'refs'/newName).delete();
+                } else {
+                    # The branches diverge.
+                    return newName;
+                }
+            }
+
+            # Loop through the changes in the journals until either they
+            # diverge or one ends.
+            while (jiter && localJiter) {
+                if (jiter.elem().change != localJiter.elem().change)
+                    break;
+                jiter.next();
+                localJiter.next();
+            }
+
+            if (jiter && !localJiter) {
+                # The new journal extends the old one.  We can just accept the
+                # new journal.
+                # TODO: move the "move branch" functionality to the chunk store.
+                (backing/'journals'/newName).moveTo(backing/'journals'/name);
+                (backing/'refs'/newName).moveTo(backing/'refs'/name);
+                return name;
+            } else if ((localJiter && !jiter) || (!jiter && !localJiter)) {
+                # Either the journals are the same or the old journal extends
+                # the new one, we can just discard the new journal.
+                (backing/'journals'/newName).delete();
+                (backing/'refs'/newName).delete();
+                return name;
+            } else {
+                # In any other case, the journals diverge.
+                return newName;
+            }
+        }
+    }
+
+    ## Pull a branch from a peer to the local instance.  This can result in the
+    ## production of a tracking branch.   Returns the name of the new branch,
+    ## which is the same as 'branch' unless a tracking branch is created.
+    ## If the branch is the current branch for the instance, the instance is
+    ## updated.
+    ##
+    ## 'peer' is the peer to try to pull from.  It can be null, in which case
+    ## we attempt to pull from any peer.
+    String pullBranch(String branch, String peer) {
+        lock := __state.lock();
+        result := __pullBranch(branch, peer);
+        if (result == __state.getBranch())
+            __state.resetTree();
+        return result;
+    }
+
+    MergeResult merge(String branch) {
+        lock := __state.lock();
+
+        # Get the local branch.
+        target := __state.getRoot().getCachedNode();
+
+        # Get the branch to merge with.
+        otherPath := __state.makeResidentBranch(branch);
+        if (!otherPath)
+            throw Exception(FStr() `Branch $branch not found`);
+        other := otherPath.getCachedNode();
+
+        # Find the common ancestor.
+        org := findCommonAncestor(target, other);
+
+        # Attempt the merge.
+        merger := Merger(target, org, other);
+        result := merger.merge();
+
+        # Install the new root node in the instance.
+        __state.setRoot(result.newRoot);
+
+        if (result.conflict) {
+            # Add a branch for the common ancestor.
+            __state.makeResidentBranch('merge:org', org);
+
+            # Build the list of conflicting paths.
+            conflict := Array[String]();
+            for (name :in result.conflict)
+                conflict.append(name);
+
+            # Attach the current merge state to the instance.
+            __state.setPendingMerge(result.getState());
+            __state.save();
+
+            return MergeResult(result.branch, null, conflict);
+        } else {
+            # Merged with no conflicts.  Clean up.
+
+            # Remove the resident branch for the branch we merged.
+            __state.removeResidentBranch(branch);
+
+            # Remove the temporary "merge branch" from the backing store.
+            ctx := __state.getRoot().getCachedNode().getContext();
+            ctx.removeBranch(merger.branch);
+
+            # Our tree is currently bogus, reset it.
+            __state.resetTree();
+
+            commit := result.newRoot.getContext().getBaselineCommit();
+            return MergeResult(null, commit, null);
+        }
+    }
+
+    ## Cleans up an existing merge.  Must have the instance state locked.
+    void __cleanupMerge(MergeState merge) {
+        ctx := __state.getRoot().getCachedNode().getContext();
+
+        # Remove the backing files for the merge branch.
+        ctx.removeBranch(merge.mergeBranch);
+
+        # Clean up the resident branches.
+        __state.removeResidentBranch(merge.otherBranch);
+        __state.removeResidentBranch('merge:org');
+
+        # Fix the merge info and rewrite the local state.
+        __state.setPendingMerge(null);
+        __state.save();
+    }
+
+    ## Close out a merge that had conflicts.  This removes the temporary merge
+    ## branches and commits the merge against the original branch.  This
+    ## fails if the original branch has received changes since the merge.
+    ##
+    ## This has a return type of 'int' only to conform to the needs of the @task
+    ## macro.  Always returns zero.
+    int resolve() {
+        lock := __state.lock();
+
+        # Get the pending merge.
+        merger := __state.makeMerger();
+
+        # XXX verify that the original branch is unchanged.
+
+        # Do a commit on the merge branch.
+        merger.commit();
+
+        # Replace the original branch.
+        rootContext := merger.newRoot.getContext();
+        __state.setHead(rootContext.getBaselineCommit());
+        __state.getStore().deleteJournal(__state.getBranch());
+
+        # Now we can just change the branch name of the root node context.
+        rootContext.setBranch(merger.orgBranch);
+
+        __cleanupMerge(__state.getPendingMerge());
+        __state.resetTree();
+        return 0;
+    }
+
+    ## Cancels the pending merge operation, removing all temporary merge
+    ## branches.
+    ## The integer return value is unused.
+    int cancelMerge() {
+        lock := __state.lock();
+
+        # Verify that there's a pending merge.  We don't do makeMerger() here
+        # because it's more expensive and unncessary.
+        merge := __state.getPendingMerge();
+        if (!merge)
+            throw Exception('No merge operations is pending');
+
+        # Return the tree to its target branch.
+        __state.setBranch(merge.targetBranch);
+
+        __cleanupMerge(merge);
+        return 0;
+    }
+
+    ## Adds a new peer to the instance (and only the instance, not the entire
+    ## network).
+    int addPeer(String peerName, String peerAddr) {
+        lock := __state.lock();
+
+        info `adding peer $peerAddr to network and backing store\n`;
+        addr := parseAddr(peerAddr);
+        if (!addr)
+            throw InvalidResourceError(FStr() `Unable to resolve $peerAddr`);
+        __net.addPeer(peerName, addr);
+
+        # Read the existing file.
+        backing := __state.getBacking();
+        peerFile := backing/'config/peers';
+        contents := peerFile.exists() ? peerFile.readAll() : '';
+
+        # Rewrite it with the new contents.
+        peerFile.parent().makeDirs();
+        writer := peerFile.writer();
+        writer.write(contents);
+
+        writer.write(FStr() I`
+            [peer-$peerName]
+            host = $(addr.getHostname())
+            port = $(addr.getPort())
+            `);
+        return 0;
+    }
+
+    ## Called when a full peer connects to the instance.  If the peer name is
+    ## known (in configuration) and the peer address is the one configured,
+    ## set up the peer connection as this one
+    int peerConnected(String peerName, PeerProxy peer) {
+        __net.addPeer(peerName, peer);
+        return 0;
+    }
+
+    ## Traverse all commits and nodes in the specified branch.  This is
+    ## mainly used to pull chunks from a peer, but also serves to verify that
+    ## all nodes are valid and present.
+    ##
+    ## There are several different traversal algorithms, see the TRAVERSE_*
+    ## constants in mawfs.rpc. 'branch' is a branch name.
+    int traverse(String branch, int algo) {
+        lock := __state.lock();
+        store := __state.getStore();
+        headDigest := store.getHead(branch);
+        if (!headDigest)
+            throw InvalidResourceError(FStr() `branch $branch does not exist`);
+        commit := store.getCommit(headDigest);
+        if (!commit)
+            throw InvalidResourceError(
+                FStr() `head commit for branch $branch could not be loaded`
+            );
+        if (algo == TRAVERSE_FULL)
+            traverseCommit(store, headDigest, null);
+        else if (algo == TRAVERSE_DELTA)
+            traverseCommit(store, headDigest, store.getTraversed());
+        else
+            throw InvalidArgumentError(FStr() `Unknown traversal type $algo`);
+        return 0;
+    }
+
+
+    ## Gets the commit named by the given dgest or branch.
+    ##
+    ## If digestOrBranch is a digest, it is alternate-base64 encoded (this is
+    ## fairly unique, but insulates the "digest or branch" logic from the
+    ## client and RPC layers)
+    CommitAndDigest getCommit(String digestOrBranch) {
+        lock := __state.lock();
+        store := __state.getStore();
+
+        CommitAndDigest makeResult(Commit commit, String digest) {
+            result := CommitAndDigest();
+            result.commit = commit;
+            result.digest = digest;
+            return result;
+        }
+
+        try {
+            digest := altDecode(digestOrBranch);
+            commit := store.getCommit(digest);
+            if (commit)
+                return makeResult(commit, digest);
+        } catch (InvalidArgumentError ex) {
+            # Just fall through, assume it to be a branch name.
+        }
+
+        digest := store.getHead(digestOrBranch);
+        if (!digest)
+            return null;
+        return makeResult(store.getCommit(digest), digest);
+    }
+
+    ## Store a commit consisting of the current branch state.  Return value is
+    ## always zero.
+    int commit(CommitMetadata metadata) {
+        lock := __state.lock();
+        __state.commit(metadata);
+        return 0;
+    }
+
+    ## RPC service for pullBranch.  Starts the call off in a new thread.
+    void pullBranch(String name, String peer,
+                    GeneralCallback[String] callback
+                    ) {
+        @task(MAWFSInstance inst; String name; String peer;, String,
+              inst.pullBranch(name, peer));
+        __pool.submit(MyTask(this, name, peer, callback));
+    }
+
+    void __pushBranch(String branch, String peerName,
+                      int traverse,
+                      GeneralCallback[String] callback
+                      ) {
+        peer := __net.getPeer(peerName);
+        if (!peer) {
+            callback(null, Exception(FStr() `peer $peerName is unkonwn`));
+            return;
+        }
+
+        proxy := peer.getProxy();
+        if (!proxy) {
+            callback(
+                null,
+                Exception(FStr() `peer $peerName not available`)
+            );
+            return;
+        }
+
+        ## Callback to be used for the pullBranch() invocation.
+        class PullBranchCallback @impl GeneralCallback[String] {
+            @cvars {
+                PeerProxy proxy;
+                int traverse;
+                GeneralCallback[String] clientCallback;
+            }
+
+            void oper call(String actualBranch, Exception error) {
+                if (error) {
+                    clientCallback(null, error);
+                    return;
+                }
+                if (traverse == TRAVERSE_NONE)
+                    clientCallback(actualBranch, null);
+                else
+                    proxy.traverseAsync(actualBranch, traverse,
+                                        clientCallback
+                                        );
+            }
+        }
+
+        proxy.pullBranchFromMe(branch,
+                               PullBranchCallback(proxy, traverse, callback)
+                               );
+    }
+
+    void pushBranch(String branch, String peerName, int traverse,
+                    GeneralCallback[String] callback
+                    ) {
+        # Even though this method is inherenntly async, we need to run it in a
+        # thread because it can potentially do connect, which is synchronous
+        # and requires a callback on the poller thread which we're currently
+        # blocking :-P.
+        class MyTask @impl Task {
+            @cvars {
+                MAWFSInstance inst;
+                String branch;
+                String peerName;
+                int traverse;
+                GeneralCallback[String] callback;
+            }
+
+            void oper call() {
+                inst.__pushBranch(branch, peerName, traverse, callback);
+            }
+        }
+        __pool.submit(MyTask(this, branch, peerName, traverse, callback));
+    }
+
+    void merge(String branch, GeneralCallback[MergeResponse] callback) {
+        @task(MAWFSInstance inst; String branch;, MergeResponse,
+              inst.merge(branch));
+        __pool.submit(MyTask(this, branch, callback));
+    }
+
+    void resolve(GeneralCallback[int] callback) {
+        @task(MAWFSInstance inst;, int, inst.resolve());
+        __pool.submit(MyTask(this, callback));
+    }
+
+    void cancelMerge(GeneralCallback[int] callback) {
+        @task(MAWFSInstance inst;, int, inst.cancelMerge());
+        __pool.submit(MyTask(this, callback));
+    }
+
+    void addPeer(String peerName, String peerAddr,
+                 GeneralCallback[int] callback
+                 ) {
+        @task(MAWFSInstance inst; String peerName; String peerAddr;, int,
+              inst.addPeer(peerName, peerAddr));
+        __pool.submit(MyTask(this, peerName, peerAddr, callback));
+    }
+
+    InfoResponse getInfo() {
+        resp := InfoResponse();
+        lock := __state.lock();
+        resp.mountpoint = __state.getMountpoint().getFullName();
+        resp.name = __state.getInstanceName();
+        return resp;
+    }
+
+    LoginState answerChallenge(String challenge) {
+        cipher := __state.getCipher();
+
+        # Provide a response to the client's challenge.
+        decryptedChallenge := cipher.decrypt(challenge);
+        if (!decryptedChallenge)
+            throw LoginError('Invalid challenge password');
+        response := cipher.encrypt(sha256(decryptedChallenge));
+
+        # Create our own challenge.
+        myChallenge := getEntropySource().getString(32);
+        expectedResponse := sha256(myChallenge);
+        myChallenge = cipher.encrypt(myChallenge);
+
+        class MyLoginState : LoginState {
+            String __expectedResponse;
+            Cipher __cipher;
+
+            oper init(String challenge, String response,
+                      String expectedResponse,
+                      Cipher cipher
+                      ) :
+                __expectedResponse = expectedResponse,
+                __cipher = cipher {
+
+                this.challenge = challenge;
+                this.response = response;
+            }
+
+            bool verifyResponse(String response) {
+                return __cipher.decrypt(response) == __expectedResponse;
+            }
+        }
+
+        return MyLoginState(myChallenge, response, expectedResponse, cipher);
+    }
+
+    bool validNonce(String nonce) {
+        return __state.getNonceManager().redeem(nonce);
+    }
+
+    PSKInfo getPSK(String identity) {
+        const pskSize := NONCE_SIZE / 2;
+        if (identity.startsWith('L')) {
+            # Local identity.  Should be the first half of a registered nonce.
+            # If it's not, we construct a random PSK to deny entry.
+            psk := __state.getNonceManager().redeemPrefix(
+                altDecode(identity.substr(1))
+            );
+            return PSKInfo(
+                (psk is null) ? getEntropySource().getString(pskSize) : psk,
+                !(psk is null)
+            );
+        } else if (identity.startsWith('A')) {
+            # Anonymous user.
+            return PSKInfo(identity.substr(1), false);
+        } else {
+            # Remote peer identity.  First character should be 'P' and the
+            # PSK should be the encrypted hash of the decoded, decrypted
+            # identity.
+            cipher := __state.getCipher();
+            String nonce;
+            try {
+                nonce = cipher.decrypt(altDecode(identity.substr(1)));
+                if (!nonce)
+                    throw InvalidArgumentError('Failed to decrypt');
+            } catch (InvalidArgumentError ex) {
+                info `Invalid identity in password request: $(ex.text)`;
+                # Random key to deny entry.
+                return PSKInfo(getEntropySource().getString(pskSize), false);
+            }
+            return PSKInfo(cipher.encrypt(sha256(nonce)), true);
+        }
+    }
+
+    void traverse(String branch, int algo, GeneralCallback[int] callback) {
+        @task(MAWFSInstance inst; String branch; int algo;, int,
+              inst.traverse(branch, algo));
+        __pool.submit(MyTask(this, branch, algo, callback));
+    }
+
+    void getCommit(String digestOrBranch,
+                   GeneralCallback[CommitAndDigest] callback
+                   ) {
+        @task(MAWFSInstance inst; String digestOrBranch;, CommitAndDigest,
+              inst.getCommit(digestOrBranch));
+        __pool.submit(MyTask(this, digestOrBranch, callback));
+    }
+
+    void commit(CommitMetadata metadata, GeneralCallback[int] callback) {
+        @task(MAWFSInstance inst; CommitMetadata metadata;, int,
+              inst.commit(metadata));
+        __pool.submit(MyTask(this, metadata, callback));
+    }
+}

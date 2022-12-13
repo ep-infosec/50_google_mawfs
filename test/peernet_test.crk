@@ -1,0 +1,220 @@
+# Copyright 2016 Google Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import crack.cont.array Array;
+import crack.fs makePath, Path;
+import crack.hash.sha256 SHA256;
+import crack.io cerr, StringWriter;
+import crack.lang Exception;
+import crack.net Address;
+import crack.net.comm2 Comm;
+import crack.logger.ctx Log;
+import crack.sys exit;
+import mawfs.aes_siv SIVCipher;
+import mawfs.ciphers sha256;
+import mawfs.params ParamInfo;
+import mawfs.peernet ClientPeer, Peer, PeerNetwork;
+import mawfs.rawchunk JournalBlock;
+import mawfs.rpc PeerProxy;
+import mawfs.testutil FakeEntropySource;
+
+@import crack.ann assert, cvars;
+
+class FakeProxy : PeerProxy {
+    Array[JournalBlock] results;
+    bool valid;
+    oper init(Array[JournalBlock] results, bool valid) :
+        PeerProxy(null),
+        results = results,
+        valid = valid {
+    }
+
+    JournalBlock getJournalBlock(String firstBlockDigest,
+                                 String branch,
+                                 uint pos
+                                 ) {
+        next := results[0];
+        results.delete(0);
+        return next;
+    }
+
+    String getFile(String filename) {
+        if (filename == 'params') {
+            pi := ParamInfo.getDefault(sha256('password'));
+            StringWriter temp = {};
+            pi.writeTo(temp, FakeEntropySource(10));
+            return temp.string();
+        } else {
+            return 'contents';
+        }
+    }
+
+    String getObject(String digest) {
+        return digest;
+    }
+
+    bool isTrue() { return valid }
+    bool reusable() { return false }
+}
+
+class TestBed {
+    PeerNetwork net;
+    Array[JournalBlock] getJournalBlockResults = {};
+    Path root;
+
+    void __resetTempDir() {
+        root = makePath('/tmp/peernet_test');
+        if (root.exists())
+            root.deleteTree();
+    }
+
+    void setUp() {
+        __resetTempDir();
+        net = PeerNetwork(null, SIVCipher(sha256('test test'), null), 'name',
+                          null
+                          );
+        peer := ClientPeer('invalid', FakeProxy(getJournalBlockResults, false));
+        net.addPeer(peer);
+        peer = ClientPeer('peer', FakeProxy(getJournalBlockResults, true));
+        net.addPeer(peer);
+    }
+
+    void tearDown() {
+        __resetTempDir();
+    }
+
+    void __assertNoJournal() {
+        @assert(!(root/'journals/master').exists());
+    }
+
+    void testPeerCleanup() {
+        @assert(net.getPeers().count() == 2);
+        paramInfo := net.pullParams(root, sha256('password'));
+        @assert(net.getPeers().count() == 1);
+    }
+
+    void testEmptyJournal() {
+        getJournalBlockResults.append(JournalBlock(null, null, true));
+        net.pullJournal(root, 'master', false);
+        __assertNoJournal();
+    }
+
+    void __assertJournalContents(String contents) {
+        journal := root/'journals/master';
+        @assert(journal.exists());
+        @assert(journal.readAll() == contents);
+    }
+
+    void testTinyJournal() {
+        getJournalBlockResults.append(JournalBlock(null, 'test data', true));
+        net.pullJournal(root, 'master', false);
+        __assertJournalContents('test data');
+    }
+
+    void testMultiBlockJournal() {
+        getJournalBlockResults.append(JournalBlock('digest', 'block1 ', false));
+        getJournalBlockResults.append(JournalBlock('digest', 'block2', true));
+        net.pullJournal(root, 'master', false);
+        __assertJournalContents('block1 block2');
+    }
+
+    void testJournalChanged() {
+        getJournalBlockResults.append(JournalBlock('digest', 'block1 ', false));
+        getJournalBlockResults.append(JournalBlock(null, null, false));
+        net.pullJournal(root, 'master', false);
+        __assertNoJournal();
+    }
+
+    void testGetFile() {
+        paramInfo := net.pullParams(root, sha256('password'));
+        @assert(paramInfo);
+        @assert((root/'params').exists());
+    }
+
+    void testPeerReorg() {
+
+        class FakePeer : Peer {
+            @cvars {
+                String name;
+                bool __reusable;
+            }
+
+
+            PeerProxy getProxy() { return null }
+            String getName() { return name }
+            String getDisplayName() { return name }
+            void shutdown() {}
+            bool reusable() { return __reusable }
+        }
+
+        Array[String] getNames(PeerNetwork net) {
+            result := Array[String]();
+            for (peer :in net.getPeers())
+                result.append(peer.getName());
+            return result;
+        }
+
+        net2 := PeerNetwork(null, SIVCipher(sha256('test test'), null), 'name',
+                            null);
+        net2.addPeer(FakePeer('delete', false));
+        net2.addPeer(FakePeer('moveToEnd', true));
+        peer := ClientPeer('peer', FakeProxy(getJournalBlockResults, true));
+        net2.addPeer(peer);
+
+        @assert(net2.getObject('foo') == 'foo');
+        @assert(getNames(net2) == Array[String]!['peer', 'moveToEnd']);
+    }
+
+    # If the journal has changed to a less than 1 block value, the server
+    # should still reply with a null first block digest and not done
+    # Test that the server gives us null, null, false when the journal is
+    # changed to empty.
+
+    oper init() {}
+
+    @static bool __run(function[void, TestBed] func, String name) {
+        bed := TestBed();
+        bed.setUp();
+        try {
+            func(bed);
+        } catch (Exception ex) {
+            bed.tearDown();
+            cerr `Exception thrown from $name: $ex\n`;
+            return false;
+        }
+        bed.tearDown();
+        return true;
+    }
+
+    @static bool runAll() {
+        bool result = true;
+        result = __run(testEmptyJournal, 'empty journal') ? result : false;
+        result = __run(testTinyJournal, 'tiny journal') ? result : false;
+        result = __run(testMultiBlockJournal, 'multi-block journal') ?
+            result : false;
+        result = __run(testJournalChanged, 'journal changed') ? result : false;
+        result = __run(testGetFile, 'get file') ? result : false;
+        result = __run(testPeerCleanup, 'peer cleanup') ? result : false;
+        result = __run(testPeerReorg, 'peer reorg') ? result : false;
+        return result;
+    }
+}
+
+if (TestBed.runAll()) {
+    cerr `ok\n`;
+} else {
+    cerr `FAILED\n`;
+    exit(1);
+}
+

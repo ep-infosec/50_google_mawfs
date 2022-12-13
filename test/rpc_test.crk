@@ -1,0 +1,415 @@
+
+import crack.functor Functor1;
+import crack.io cerr, FStr;
+import crack.lang AssertionError, Exception, InvalidArgumentError;
+import crack.logger.ctx Log;
+import crack.net InetAddress, Poller, PollEvent, PollEventCallback, Socket,
+    SocketApd, AF_INET, SOCK_STREAM;
+import crack.net.comm2 Comm, CommListener, Connection, ConnectionFactory,
+    WaiterFor;
+import crack.net.ssl SSLContext;
+import crack.runtime exit;
+import mawfs.aes_siv SIVCipher;
+import mawfs.blockstore Commit, CommitMetadata;
+import mawfs.ciphers sha256, Cipher;
+import mawfs.rawchunk GeneralCallback, JournalBlock, RawChunkReader;
+import mawfs.rpc parseAddr, CommitAndDigest, Context, GetFileResponse,
+    GetObjectResponse, InfoResponse, InstIFace, LoginError, LoginState,
+    MergeResponse, MethodHandler, MethodMap, PeerProxy,
+    PeerServiceConnectionFactory, PSKInfo, RemoteError, RPCMessage;
+import mawfs.ssl makeSSLContext;
+
+@import crack.ann assert, impl;
+
+## A socket initialization callback that captures the port number.
+class PortCollectorCallback @impl Functor1[void, Socket] {
+
+    ## Wait on this to get the port number.
+    WaiterFor[int, int] waiter = {0};
+
+    void oper call(Socket sock) {
+        s := SocketApd(Socket.cast(sock));
+        InetAddress addr = {0, 0};
+        s.getSocketAddress(addr);
+        port := addr.getPort();
+        waiter.setResult(port);
+    }
+}
+
+class FakeChunkReader @impl RawChunkReader {
+    void readRawChunk(String digest, GeneralCallback[String] callback) {
+        callback('from the chunk reader', null);
+    }
+
+    void getHead(String branch, GeneralCallback[String] callback) {
+        callback('digest', null);
+    }
+
+    void getJournalBlock(String firstBlockDigest, String branch, uint pos,
+                         GeneralCallback[JournalBlock] callback) {
+        callback(JournalBlock(firstBlockDigest, branch + ' contents', pos > 0),
+                 null
+                 );
+    }
+
+    void getFile(String filename, GeneralCallback[String] callback) {
+        callback('contents', null);
+    }
+}
+
+class FakeInstance @impl InstIFace {
+    Cipher cipher;
+    String peerName;
+    PeerProxy peerProxy;
+    CommitMetadata lastCommit;
+
+    oper init(Cipher cipher) : cipher = cipher {}
+
+    void pullBranch(String branch, String peer,
+                    GeneralCallback[String] callback
+                    ) {
+    }
+
+    void pushBranch(String branch, String peer, int traverse,
+                    GeneralCallback[String] callback
+                    ) {
+        callback(FStr() `$branch$traverse`, null);
+    }
+
+    void merge(String branch, GeneralCallback[MergeResponse] callback) {}
+
+    void resolve(GeneralCallback[int] callback) {}
+    void cancelMerge(GeneralCallback[int] callback) {}
+
+    void getCommit(String digestOrBranch,
+                   GeneralCallback[CommitAndDigest] callback
+                   ) {
+        resp := CommitAndDigest();
+        resp.commit = Commit();
+        resp.commit.root = 'commit root';
+        resp.digest = digestOrBranch;
+        callback(resp, null);
+    }
+
+    void commit(CommitMetadata metadata, GeneralCallback[int] callback) {
+        lastCommit = metadata;
+        callback(0, null);
+    }
+
+    void addPeer(String peerName, String peerAddr,
+                 GeneralCallback[int] callback
+                 ) {
+    }
+    InfoResponse getInfo() { return null }
+
+    void traverse(String branch, int algo,
+                  GeneralCallback[int] callback
+                  ) {
+    }
+
+    LoginState answerChallenge(String challenge) {
+        class FakeLoginState : LoginState {
+            String expected;
+            oper init(String challenge, String response, String expected) :
+                expected = expected {
+
+                this.challenge = challenge;
+                this.response = response;
+            }
+
+            bool verifyResponse(String response) {
+                return response == expected;
+            }
+        }
+
+        decrypted := cipher.decrypt(challenge);
+        if (!decrypted)
+            throw LoginError('Invalid challenge');
+        response := cipher.encrypt(sha256(decrypted));
+        myChallenge := 'challenge';
+        expected := cipher.encrypt(sha256(myChallenge));
+        return FakeLoginState(cipher.encrypt(myChallenge), response,
+                              expected
+                              );
+    }
+
+    bool validNonce(String nonce) {
+        return nonce == 'nonce';
+    }
+
+    PSKInfo getPSK(String identity) {
+        if (identity == 'identity')
+            return PSKInfo(identity, true);
+        else
+            return PSKInfo('invalid', false);
+    }
+
+    int peerConnected(String name, PeerProxy proxy) {
+        peerName = name;
+        peerProxy = proxy;
+        return 0;
+    }
+}
+
+void clientSideGetObject(Context context, RPCMessage msg, Connection conn) {
+    resp := GetObjectResponse();
+    resp.data = 'client data';
+    context.writeResponse(conn, resp, msg.id);
+}
+
+void clientSideGetFile(Context context, RPCMessage msg, Connection conn) {
+    resp := GetFileResponse();
+    class Collector @impl GeneralCallback[String] {
+        String result;
+        void oper call(String result, Exception ex) {
+            this.result = result;
+        }
+    }
+    collector := Collector();
+    context.reader.getFile('xxx', collector);
+    resp.data = collector.result;
+    context.writeResponse(conn, resp, msg.id);
+}
+
+class RPCTestBed {
+
+    Comm comm;
+    Log log;
+    bool ssl;
+    bool badPSK;
+
+    ## Server port number.
+    int port;
+
+    FakeInstance inst;
+
+    Cipher cipher = SIVCipher(sha256('weak password'), null);
+
+    oper init(bool ssl) : ssl = ssl {}
+
+    SSLContext __getSSLContext() {
+        if (ssl)
+            return makeSSLContext(FakeInstance(cipher), comm,
+                                  badPSK ? 'invalid' : 'identity',
+                                  'identity'
+                                  );
+        else
+            return null;
+    }
+
+    void startServer() {
+        portCallback := PortCollectorCallback();
+        ConnectionFactory factory =
+            PeerServiceConnectionFactory(FakeChunkReader(),
+                                         inst = FakeInstance(cipher)
+                                         );
+        if (ssl)
+            factory = __getSSLContext().makeConnectionFactory(factory);
+        listener := CommListener(log, factory);
+        listener.addSocketInitCallback(portCallback);
+        comm.startServer(InetAddress(127, 0, 0, 1, 0), listener, true);
+        port = portCallback.waiter.getResult();
+    }
+
+    void setUp() {
+        log = Log(null, cerr, cerr, cerr, cerr, 'server');
+        comm = Comm(log);
+        comm.start();
+        startServer();
+    }
+
+    PeerProxy makePeerProxy() {
+        return PeerProxy.make(comm, Log(log, 'client'),
+                              FStr() `127.0.0.1:$port`,
+                              __getSSLContext()
+                              );
+    }
+
+    ## Make a peer proxy that stubs out server methods.
+    PeerProxy makePeerProxy(MethodMap methods) {
+        return PeerProxy.make(comm, Log(log, 'client'),
+                              FStr() `127.0.0.1:$port`,
+                              __getSSLContext(),
+                              methods,
+                              FakeChunkReader()
+                              );
+    }
+
+    void testGetObject() {
+        peer := makePeerProxy();
+        @assert(peer);
+        peer.login(cipher);
+        @assert(peer.getObject('foo') == 'from the chunk reader');
+    }
+
+    void testGetHead() {
+        peer := makePeerProxy();
+        peer.login(cipher);
+        @assert(peer.getHead('master') == 'digest');
+    }
+
+    void testReadJournal() {
+        peer := makePeerProxy();
+        peer.login(cipher);
+        jb := peer.getJournalBlock('digest', 'branch', 0);
+        @assert(jb.firstBlockDigest == 'digest');
+        @assert(jb.contents == 'branch contents');
+        @assert(!jb.done);
+
+        jb = peer.getJournalBlock('digest', 'branch', 1);
+        @assert(jb.done);
+    }
+
+    void testGetFile() {
+        peer := makePeerProxy();
+        peer.login(cipher);
+        @assert(peer.getFile('filename') == 'contents');
+    }
+
+    void testPeerLogin() {
+        peer := makePeerProxy();
+        peer.login(cipher);
+    }
+
+    void testFailingPeerLogin() {
+        peer := makePeerProxy();
+        try {
+            peer.login(SIVCipher(sha256('wrong password'), null));
+            @assert(false);
+        } catch (LoginError ex) {
+        }
+        try {
+            peer.getObject('foo');
+            @assert(false);
+        } catch (RemoteError ex) {
+        }
+    }
+
+    void testUserLogin() {
+        peer := makePeerProxy();
+        peer.login('nonce');
+    }
+
+    void testFailedUserLogin() {
+        peer := makePeerProxy();
+        try {
+            peer.login('badnonce');
+            @assert(false);
+        } catch (LoginError ex) {
+        }
+        try {
+            peer.getObject('foo');
+            @assert(false);
+        } catch (RemoteError ex) {
+        }
+    }
+
+    void testPeerConnected() {
+        methods := MethodMap();
+        methods['getObject'] = MethodHandler(clientSideGetObject);
+        methods['getFile'] = MethodHandler(clientSideGetFile);
+        peer := makePeerProxy(methods);
+        peer.login(cipher);
+        peer.peerConnected('foo');
+        @assert(inst.peerName == 'foo');
+
+        peer.setAuthenticated(true);
+        result := inst.peerProxy.getObject('digest');
+        @assert(result == 'client data');
+
+        # Test the chunk reader.
+        @assert(inst.peerProxy.getFile('foo') == 'contents');
+    }
+
+    void testPushBranch() {
+        methods := MethodMap();
+        methods['getObject'] = MethodHandler(clientSideGetObject);
+        methods['getFile'] = MethodHandler(clientSideGetFile);
+        peer := makePeerProxy(methods);
+        peer.login(cipher);
+        @assert(peer.pushBranch('master', 'peer', 1) == 'master1');
+    }
+
+    void testGetCommit() {
+        peer := makePeerProxy();
+        peer.login(cipher);
+        commitAndDigest := peer.getCommit('branch123');
+        @assert(commitAndDigest.digest == 'branch123');
+        @assert(commitAndDigest.commit.root == 'commit root');
+    }
+
+    void testCommit() {
+        peer := makePeerProxy();
+        peer.login(cipher);
+        md := CommitMetadata();
+        md.comment = 'commit comment';
+        md.committer = 'commit author';
+        peer.commit(md);
+        @assert(inst.lastCommit == md);
+    }
+
+    void tearDown() {
+        comm.stop();
+    }
+}
+
+# Test parseAddr()
+if (true) {
+    addr := parseAddr('localhost:12345');
+    @assert(!addr.ssl);
+    @assert(addr.getPort() == 12345);
+
+    addr = parseAddr('localhost:12345:ssl');
+    @assert(addr.ssl);
+    @assert(addr.getPort() == 12345);
+
+    addr = parseAddr('localhost:12345:tcp');
+    @assert(!addr.ssl);
+    @assert(addr.getPort() == 12345);
+
+    try {
+        parseAddr('localhost:12345:bogus');
+        @assert(false && 'No exceptionn thrown for invalid proto');
+    } catch (InvalidArgumentError ex) {
+    }
+}
+
+testbed := RPCTestBed(false);
+testbed.setUp();
+try {
+    testbed.testGetObject();
+    testbed.testGetHead();
+    testbed.testReadJournal();
+    testbed.testGetFile();
+    testbed.testPeerLogin();
+    testbed.testFailingPeerLogin();
+    testbed.testUserLogin();
+    testbed.testFailedUserLogin();
+    testbed.testPeerConnected();
+    testbed.testPushBranch();
+    testbed.testGetCommit();
+    testbed.testCommit();
+} catch (Exception ex) {
+    testbed.tearDown();
+    throw ex;
+}
+
+# Test SSL functionality.
+testbed = RPCTestBed(true);
+testbed.setUp();
+try {
+    testbed.testGetObject();
+
+    testbed.badPSK = true;
+    try {
+        testbed.testGetObject();
+        exit(1);
+    } catch (AssertionError ex) {
+    }
+} catch (Exception ex) {
+    testbed.tearDown();
+    throw ex;
+}
+
+cerr `ok\n`;
+
